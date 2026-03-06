@@ -1,0 +1,954 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SignalScope API Demo</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #101828;
+      --muted: #667085;
+      --line: #d0d5dd;
+      --accent: #0b63ce;
+      --ok: #067647;
+      --warn: #b54708;
+      --bad: #b42318;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      color: var(--text);
+      background: linear-gradient(180deg, #f8fbff 0%, #f5f7fb 100%);
+    }
+
+    .wrap {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+
+    .lead {
+      margin: 0 0 20px;
+      color: var(--muted);
+    }
+
+    .grid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    @media (max-width: 980px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 2px 6px rgba(16, 24, 40, 0.05);
+    }
+
+    .panel h2 {
+      margin: 0 0 10px;
+      font-size: 17px;
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .row label {
+      font-size: 12px;
+      color: var(--muted);
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    input, select, textarea, button {
+      font: inherit;
+    }
+
+    input, select, textarea {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px 9px;
+      background: #fff;
+      min-height: 34px;
+    }
+
+    input:not([type="checkbox"]), select { min-width: 90px; }
+
+    input[type="checkbox"] {
+      width: 14px;
+      height: 14px;
+      min-width: 14px;
+      min-height: 14px;
+      padding: 0;
+      margin: 0;
+      appearance: auto;
+      accent-color: var(--accent);
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 84px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    button {
+      border: 1px solid #0a56b6;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 8px;
+      min-height: 34px;
+      padding: 0 10px;
+      cursor: pointer;
+    }
+
+    button.alt {
+      background: #fff;
+      color: var(--text);
+      border-color: var(--line);
+    }
+
+    button.warn {
+      background: #fff7ed;
+      color: #7c2d12;
+      border-color: #fdba74;
+    }
+
+    button.bad {
+      background: #fef2f2;
+      color: #7f1d1d;
+      border-color: #fca5a5;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 12px;
+      margin: 0;
+    }
+
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(90px, 1fr));
+      gap: 8px;
+      margin: 8px 0;
+    }
+
+    .kpi {
+      background: #f8fafc;
+      border: 1px solid #e4e7ec;
+      border-radius: 8px;
+      padding: 6px 8px;
+      min-height: 54px;
+    }
+
+    .kpi .k {
+      font-size: 11px;
+      color: var(--muted);
+      display: block;
+    }
+
+    .kpi .v {
+      font-size: 17px;
+      font-weight: 600;
+      display: block;
+      margin-top: 2px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    th, td {
+      border-bottom: 1px solid #eaecf0;
+      padding: 6px 4px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th { color: var(--muted); font-weight: 600; }
+
+    .table-wrap {
+      overflow: auto;
+      max-height: 320px;
+      border: 1px solid #eaecf0;
+      border-radius: 8px;
+    }
+
+    pre {
+      margin: 0;
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 8px;
+      padding: 10px;
+      max-height: 220px;
+      overflow: auto;
+      font-size: 12px;
+    }
+
+    .status-ok { color: var(--ok); }
+    .status-warn { color: var(--warn); }
+    .status-bad { color: var(--bad); }
+
+    details.api-help {
+      margin: 8px 0 12px;
+      border: 1px dashed #cbd5e1;
+      border-radius: 8px;
+      background: #f8fafc;
+      padding: 6px 8px;
+    }
+
+    details.api-help > summary {
+      cursor: pointer;
+      user-select: none;
+      font-size: 12px;
+      color: #334155;
+      font-weight: 600;
+      list-style: none;
+    }
+
+    details.api-help > summary::-webkit-details-marker {
+      display: none;
+    }
+
+    details.api-help > summary::before {
+      content: "? ";
+      color: #0b63ce;
+      font-weight: 700;
+    }
+
+    details.api-help pre {
+      margin-top: 8px;
+      max-height: 180px;
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>SignalScope API Demo</h1>
+    <p class="lead">Minimal, control-by-control reference. Each panel has local JS so users can copy one feature at a time.</p>
+
+    <script>
+      window.ssUtil = (() => {
+        const el = (id) => document.getElementById(id);
+
+        function log(message, payload) {
+          const node = el("log");
+          if (!node) return;
+          const ts = new Date().toLocaleTimeString();
+          let line = `[${ts}] ${message}`;
+          if (payload !== undefined) {
+            line += (typeof payload === "string") ? ` ${payload}` : ` ${JSON.stringify(payload)}`;
+          }
+          node.textContent = `${line}\n${node.textContent}`.slice(0, 20000);
+        }
+
+        function parseNumber(value, fallback = 0) {
+          if (value == null) return fallback;
+          const text = String(value).trim();
+          if (!text.length) return fallback;
+          const n = text.toLowerCase().startsWith("0x") ? parseInt(text, 16) : parseInt(text, 10);
+          return Number.isFinite(n) ? n : fallback;
+        }
+
+        function toHexId(canId) {
+          return `0x${Number(canId >>> 0).toString(16).toUpperCase().padStart(3, "0")}`;
+        }
+
+        function parseDataBytes(inputText) {
+          const cleaned = String(inputText || "").replace(/0x/gi, " ");
+          const parts = (cleaned.match(/[0-9a-fA-F]{1,2}/g) || []);
+          const out = new Array(8).fill("00");
+          for (let i = 0; i < Math.min(parts.length, 8); i += 1) {
+            const n = parseNumber(`0x${parts[i]}`, 0) & 0xff;
+            out[i] = n.toString(16).toUpperCase().padStart(2, "0");
+          }
+          return out;
+        }
+
+        async function request(path, options = {}) {
+          const response = await fetch(path, options);
+          const text = await response.text();
+          let payload = text;
+          try { payload = JSON.parse(text); } catch (_) {}
+          if (!response.ok) {
+            const err = (typeof payload === "object") ? JSON.stringify(payload) : String(payload);
+            throw new Error(`${response.status} ${response.statusText}: ${err}`);
+          }
+          return payload;
+        }
+
+        function postForm(path, values) {
+          const params = new URLSearchParams();
+          Object.entries(values || {}).forEach(([k, v]) => {
+            if (v === undefined || v === null || v === "") return;
+            params.set(k, String(v));
+          });
+          return request(path, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+            body: params.toString(),
+          });
+        }
+
+        function postText(path, text) {
+          return request(path, {
+            method: "POST",
+            headers: { "Content-Type": "text/plain;charset=UTF-8" },
+            body: text,
+          });
+        }
+
+        async function run(label, fn) {
+          try {
+            return await fn();
+          } catch (error) {
+            log(`${label} error`, error.message || String(error));
+            const pill = el("status-pill");
+            if (pill) {
+              pill.textContent = `${label} failed`;
+              pill.className = "status-bad";
+            }
+            throw error;
+          }
+        }
+
+        return { el, log, parseNumber, toHexId, parseDataBytes, request, postForm, postText, run };
+      })();
+    </script>
+
+    <div class="grid">
+      <section class="panel">
+        <h2>Gateway Status</h2>
+        <details class="api-help">
+          <summary>API help</summary>
+          <pre class="mono">GET /api/status
+Used by: ssStatus.refresh() and 1 Hz auto-poll.
+Reads: FPS, drops, path latency, rule counts, DBC/replay status.
+Example:
+fetch('/api/status').then(r => r.json())</pre>
+        </details>
+        <div class="row">
+          <button onclick="ssStatus.refreshSafe()">Refresh</button>
+          <label><input type="checkbox" id="auto-poll" checked> Auto poll (1 Hz)</label>
+          <span id="status-pill" class="hint">No data yet</span>
+        </div>
+        <div class="kpis">
+          <div class="kpi"><span class="k">FPS</span><span class="v" id="kpi-fps">-</span></div>
+          <div class="kpi"><span class="k">Fast Path</span><span class="v" id="kpi-fast">-</span></div>
+          <div class="kpi"><span class="k">Active Path</span><span class="v" id="kpi-active">-</span></div>
+          <div class="kpi"><span class="k">Forwarded</span><span class="v" id="kpi-fwd">-</span></div>
+          <div class="kpi"><span class="k">Drops Run</span><span class="v" id="kpi-drops">-</span></div>
+          <div class="kpi"><span class="k">Rules</span><span class="v" id="kpi-rules">-</span></div>
+        </div>
+        <pre id="status-json" class="mono">{}</pre>
+      </section>
+      <script>
+        window.ssStatus = (() => {
+          const { el, request, log, run } = window.ssUtil;
+
+          async function refresh() {
+            const s = await request("/api/status");
+            el("status-json").textContent = JSON.stringify(s, null, 2);
+
+            el("kpi-fps").textContent = s.frame_rate_fps ?? "-";
+            el("kpi-fast").textContent = `${s.fast_path_avg_us ?? "-"} us`;
+            el("kpi-active").textContent = `${s.active_path_avg_us ?? "-"} us`;
+            el("kpi-fwd").textContent = s.forwarded_frames ?? "-";
+            el("kpi-drops").textContent = s.rx_drops_run ?? "-";
+            el("kpi-rules").textContent = s.active_mutations ?? "-";
+
+            const busReady = !!s.bus_a_ready && !!s.bus_b_ready;
+            const dbcLoaded = !!s.dbc_loaded;
+            const mode = s.observation_mode || "none";
+            const pill = el("status-pill");
+            pill.textContent = `bus=${busReady ? "up" : "down"} dbc=${dbcLoaded ? "yes" : "no"} obs=${mode}`;
+            pill.className = busReady ? "status-ok" : "status-warn";
+            return s;
+          }
+
+          async function refreshSafe() {
+            await run("status", refresh);
+            log("status", "ok");
+          }
+
+          return { refresh, refreshSafe };
+        })();
+      </script>
+
+      <section class="panel">
+        <h2>Observation / Decode Mode</h2>
+        <details class="api-help">
+          <summary>API help</summary>
+          <pre class="mono">POST /api/observe  (form-url-encoded)
+Fields:
+- mode: none | all | specific
+- ids: \"0x280:A_TO_B,0x1A0:B_TO_A\" (only for specific)
+This controls frame observation and decode activation.
+Example:
+mode=specific&amp;ids=0x280:A_TO_B</pre>
+        </details>
+        <div class="row">
+          <label>Mode
+            <select id="observe-mode">
+              <option value="none">none</option>
+              <option value="all">all</option>
+              <option value="specific">specific</option>
+            </select>
+          </label>
+          <button onclick="ssObserve.applySafe()">Apply</button>
+        </div>
+        <input id="observe-ids" style="width:100%" placeholder="specific ids: 0x280:A_TO_B,0x1A0:B_TO_A">
+        <p class="hint">Use <span class="mono">all</span> to decode broadly. Use <span class="mono">specific</span> to observe specific frame IDs/directions.</p>
+      </section>
+      <script>
+        window.ssObserve = (() => {
+          const { el, postForm, log, run } = window.ssUtil;
+
+          async function apply() {
+            const mode = el("observe-mode").value;
+            const ids = el("observe-ids").value.trim();
+            const out = await postForm("/api/observe", { mode, ids });
+            log("observe", out);
+            return out;
+          }
+
+          async function applySafe() {
+            await run("observe", apply);
+          }
+
+          return { apply, applySafe };
+        })();
+      </script>
+
+      <section class="panel" style="grid-column: 1 / -1;">
+        <h2>Live Frames</h2>
+        <details class="api-help">
+          <summary>API help</summary>
+          <pre class="mono">GET /api/frame_cache?limit=40
+Used by: ssFrames.refresh().
+UI then applies local filter CSV by CAN ID and direction.
+Example:
+fetch('/api/frame_cache?limit=40').then(r => r.json())</pre>
+        </details>
+        <div class="row">
+          <label>Limit <input id="frame-limit" value="40" class="mono" style="width:72px"></label>
+          <label style="flex:1 1 360px;">Filter CSV (IDs + optional direction)
+            <input id="frame-filter" class="mono" style="width:100%" placeholder="0x280,0x1A0,A_TO_B">
+          </label>
+          <button onclick="ssFrames.refreshSafe()">Refresh Frames</button>
+        </div>
+        <p class="hint">Examples: <span class="mono">0x280,0x1A0,A_TO_B</span> or <span class="mono">0x280,B_TO_A</span></p>
+        <div class="table-wrap">
+          <table id="frames-table">
+            <thead>
+              <tr>
+                <th>CAN ID</th>
+                <th>Direction</th>
+                <th>DLC</th>
+                <th>Data</th>
+                <th>Rate Hz</th>
+                <th>Mutated</th>
+                <th>Timestamp us</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+      <script>
+        window.ssFrames = (() => {
+          const { el, request, parseNumber, toHexId, log, run } = window.ssUtil;
+
+          function parseFrameFilter(text) {
+            const tokens = String(text || "").split(",").map((x) => x.trim()).filter(Boolean);
+            let direction = "ANY";
+            const ids = [];
+            for (const token of tokens) {
+              const t = token.toUpperCase();
+              if (t === "A_TO_B" || t === "A2B") { direction = "A_TO_B"; continue; }
+              if (t === "B_TO_A" || t === "B2A") { direction = "B_TO_A"; continue; }
+              const n = parseNumber(token, NaN);
+              if (Number.isFinite(n)) ids.push(n >>> 0);
+            }
+            return { ids, direction };
+          }
+
+          function render(frames) {
+            const body = el("frames-table").querySelector("tbody");
+            body.innerHTML = "";
+            for (const frame of frames) {
+              const tr = document.createElement("tr");
+              tr.innerHTML = `
+                <td class="mono">${toHexId(frame.can_id)}</td>
+                <td class="mono">${frame.direction}</td>
+                <td class="mono">${frame.dlc}</td>
+                <td class="mono">${frame.data || ""}</td>
+                <td class="mono">${frame.rate_hz ?? ""}</td>
+                <td class="mono">${frame.mutated ? "yes" : "no"}</td>
+                <td class="mono">${frame.timestamp_us ?? ""}</td>
+              `;
+              body.appendChild(tr);
+            }
+          }
+
+          async function refresh() {
+            const limit = parseNumber(el("frame-limit").value, 40);
+            const payload = await request(`/api/frame_cache?limit=${encodeURIComponent(limit)}`);
+            const allFrames = Array.isArray(payload.frames) ? payload.frames : [];
+            const filter = parseFrameFilter(el("frame-filter").value);
+            const filtered = allFrames.filter((f) => {
+              const idOk = filter.ids.length === 0 || filter.ids.includes(Number(f.can_id >>> 0));
+              const dirOk = filter.direction === "ANY" || f.direction === filter.direction;
+              return idOk && dirOk;
+            });
+            render(filtered);
+            log("frame_cache", { total: allFrames.length, shown: filtered.length });
+          }
+
+          async function refreshSafe() {
+            await run("frames", refresh);
+          }
+
+          return { refresh, refreshSafe };
+        })();
+      </script>
+
+      <section class="panel" style="grid-column: 1 / -1;">
+        <h2>Signal Cache (Decoded)</h2>
+        <details class="api-help">
+          <summary>API help</summary>
+          <pre class="mono">GET /api/signal_cache
+Optional query:
+- indexes=0,1,2
+Used by: ssSignals.refresh().
+Shows current decoded values, generation, and subscription flags.</pre>
+        </details>
+        <div class="row">
+          <label style="flex:1 1 360px;">Indexes CSV
+            <input id="signal-indexes" class="mono" style="width:100%" placeholder="0,1,2 or blank for all">
+          </label>
+          <button onclick="ssSignals.refreshSafe()">Refresh Signals</button>
+        </div>
+        <div class="table-wrap">
+          <table id="signals-table">
+            <thead>
+              <tr>
+                <th>Index</th>
+                <th>CAN ID</th>
+                <th>Name</th>
+                <th>Value</th>
+                <th>Generation</th>
+                <th>Valid</th>
+                <th>Subscribed</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+      <script>
+        window.ssSignals = (() => {
+          const { el, request, toHexId, log, run } = window.ssUtil;
+
+          function render(signals) {
+            const body = el("signals-table").querySelector("tbody");
+            body.innerHTML = "";
+            for (const s of signals) {
+              const tr = document.createElement("tr");
+              tr.innerHTML = `
+                <td class="mono">${s.index}</td>
+                <td class="mono">${toHexId(s.can_id || 0)}</td>
+                <td class="mono">${s.name || ""}</td>
+                <td class="mono">${s.value}</td>
+                <td class="mono">${s.generation}</td>
+                <td class="mono">${s.valid ? "true" : "false"}</td>
+                <td class="mono">${s.subscribed ? "true" : "false"}</td>
+              `;
+              body.appendChild(tr);
+            }
+          }
+
+          async function refresh() {
+            const indexes = el("signal-indexes").value.trim();
+            const url = indexes ? `/api/signal_cache?indexes=${encodeURIComponent(indexes)}` : "/api/signal_cache";
+            const payload = await request(url);
+            const signals = Array.isArray(payload.signals) ? payload.signals : [];
+            render(signals);
+            log("signal_cache", { count: signals.length });
+          }
+
+          async function refreshSafe() {
+            await run("signals", refresh);
+          }
+
+          return { refresh, refreshSafe };
+        })();
+      </script>
+
+      <section class="panel" style="grid-column: 1 / -1;">
+        <h2>Replay / Send Timing</h2>
+        <details class="api-help">
+          <summary>API help</summary>
+          <pre class="mono">POST /api/replay/send  (form-url-encoded)
+Fields:
+- can_id, dlc, direction, data(16 hex chars)
+- repeat, interval_us, start_delay_us, auto_start
+
+POST /api/replay  (form-url-encoded)
+Fields:
+- action=start|stop
+- loop_mode=PLAY_ONCE|LOOP_RAW|LOOP_WITH_COUNTER_CONTINUATION
+- start_delay_us
+
+This lets users control send timing directly from API.</pre>
+        </details>
+        <div class="row">
+          <label>CAN ID <input id="send-id" class="mono" value="0x280"></label>
+          <label>DLC <input id="send-dlc" class="mono" value="8" style="width:64px"></label>
+          <label>Dir
+            <select id="send-dir">
+              <option>A_TO_B</option>
+              <option>B_TO_A</option>
+            </select>
+          </label>
+          <label>Repeat <input id="send-repeat" class="mono" value="1" style="width:70px"></label>
+          <label>Interval us <input id="send-interval-us" class="mono" value="0" style="width:96px"></label>
+          <label>Start delay us <input id="send-start-delay-us" class="mono" value="0" style="width:108px"></label>
+        </div>
+        <input id="send-data" class="mono" style="width:100%" value="00 00 00 00 00 00 00 00">
+        <div class="row" style="margin-top:8px">
+          <button onclick="ssReplay.sendViaApi()">/api/replay/send</button>
+          <button class="alt" onclick="ssReplay.startLoaded()">Start Loaded Replay</button>
+          <button class="alt" onclick="ssReplay.stop()">Stop Replay</button>
+          <label>Loop Mode
+            <select id="replay-loop-mode">
+              <option value="PLAY_ONCE">PLAY_ONCE</option>
+              <option value="LOOP_RAW">LOOP_RAW</option>
+              <option value="LOOP_WITH_COUNTER_CONTINUATION">LOOP_WITH_COUNTER_CONTINUATION</option>
+            </select>
+          </label>
+        </div>
+        <p class="hint">Timing controls are API-backed: <span class="mono">repeat</span>, <span class="mono">interval_us</span>, <span class="mono">start_delay_us</span>.</p>
+      </section>
+      <script>
+        window.ssReplay = (() => {
+          const { el, parseNumber, parseDataBytes, postForm, log, run } = window.ssUtil;
+
+          function payload() {
+            return {
+              can_id: parseNumber(el("send-id").value, 0),
+              dlc: parseNumber(el("send-dlc").value, 8),
+              direction: el("send-dir").value,
+              data: parseDataBytes(el("send-data").value).join(""),
+              repeat: parseNumber(el("send-repeat").value, 1),
+              interval_us: parseNumber(el("send-interval-us").value, 0),
+              start_delay_us: parseNumber(el("send-start-delay-us").value, 0),
+              auto_start: 1,
+            };
+          }
+
+          async function sendViaApi() {
+            await run("replay/send", async () => {
+              const out = await postForm("/api/replay/send", payload());
+              log("replay_send", out);
+              return out;
+            });
+          }
+
+          async function startLoaded() {
+            await run("replay start", async () => {
+              const out = await postForm("/api/replay", {
+                action: "start",
+                loop_mode: el("replay-loop-mode").value,
+                start_delay_us: parseNumber(el("send-start-delay-us").value, 0),
+              });
+              log("replay_start", out);
+              return out;
+            });
+          }
+
+          async function stop() {
+            await run("replay stop", async () => {
+              const out = await postForm("/api/replay", { action: "stop" });
+              log("replay_stop", out);
+              return out;
+            });
+          }
+
+          return { sendViaApi, startLoaded, stop };
+        })();
+      </script>
+
+      <section class="panel">
+        <h2>Stage BIT_RANGE Rule</h2>
+        <details class="api-help">
+          <summary>API help</summary>
+          <pre class="mono">POST /api/rules/stage  (form-url-encoded)
+Fields:
+- rule_kind=BIT_RANGE
+- can_id, direction, start_bit, length
+- replace_value, dynamic, enabled
+Rule is staged only; commit required to activate.</pre>
+        </details>
+        <div class="row">
+          <label>ID <input id="bit-id" class="mono" value="0x280"></label>
+          <label>Dir
+            <select id="bit-dir">
+              <option>A_TO_B</option>
+              <option>B_TO_A</option>
+            </select>
+          </label>
+          <label>Start <input id="bit-start" class="mono" value="0" style="width:68px"></label>
+          <label>Len <input id="bit-len" class="mono" value="8" style="width:68px"></label>
+        </div>
+        <div class="row">
+          <label>Value <input id="bit-value" class="mono" value="0" style="width:88px"></label>
+          <label><input type="checkbox" id="bit-dynamic"> dynamic</label>
+          <label><input type="checkbox" id="bit-enabled" checked> enabled</label>
+          <button onclick="ssRules.stageBit()">Stage BIT_RANGE</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Stage RAW_MASK Rule</h2>
+        <details class="api-help">
+          <summary>API help</summary>
+          <pre class="mono">POST /api/rules/stage  (form-url-encoded)
+Fields:
+- rule_kind=RAW_MASK
+- can_id, direction, mask, value, enabled
+mask/value are 16 hex chars (8 bytes).</pre>
+        </details>
+        <div class="row">
+          <label>ID <input id="raw-id" class="mono" value="0x280"></label>
+          <label>Dir
+            <select id="raw-dir">
+              <option>A_TO_B</option>
+              <option>B_TO_A</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="raw-enabled" checked> enabled</label>
+        </div>
+        <input id="raw-mask" class="mono" style="width:100%" value="00000000000000FF" placeholder="16 hex bytes mask">
+        <input id="raw-value" class="mono" style="width:100%; margin-top:8px" value="0000000000000001" placeholder="16 hex bytes value">
+        <div class="row" style="margin-top:8px">
+          <button onclick="ssRules.stageRaw()">Stage RAW_MASK</button>
+        </div>
+      </section>
+      <script>
+        window.ssRules = (() => {
+          const { el, parseNumber, postForm, postText, request, log, run } = window.ssUtil;
+
+          async function stageBit() {
+            await run("stage bit", async () => {
+              const out = await postForm("/api/rules/stage", {
+                rule_kind: "BIT_RANGE",
+                can_id: parseNumber(el("bit-id").value, 0),
+                direction: el("bit-dir").value,
+                start_bit: parseNumber(el("bit-start").value, 0),
+                length: parseNumber(el("bit-len").value, 8),
+                replace_value: parseNumber(el("bit-value").value, 0),
+                dynamic: el("bit-dynamic").checked ? 1 : 0,
+                enabled: el("bit-enabled").checked ? 1 : 0,
+              });
+              log("stage_bit", out);
+              return out;
+            });
+          }
+
+          async function stageRaw() {
+            await run("stage raw", async () => {
+              const out = await postForm("/api/rules/stage", {
+                rule_kind: "RAW_MASK",
+                can_id: parseNumber(el("raw-id").value, 0),
+                direction: el("raw-dir").value,
+                mask: el("raw-mask").value.trim(),
+                value: el("raw-value").value.trim(),
+                enabled: el("raw-enabled").checked ? 1 : 0,
+              });
+              log("stage_raw", out);
+              return out;
+            });
+          }
+
+          async function action(name) {
+            await run(`rules ${name}`, async () => {
+              const out = await postText("/api/rules", name);
+              log(`rules_${name}`, out);
+              return out;
+            });
+          }
+
+          async function list() {
+            await run("rules list", async () => {
+              const out = await request("/api/rules");
+              el("rules-json").textContent = JSON.stringify(out, null, 2);
+              log("rules_list", { count: out.count });
+              return out;
+            });
+          }
+
+          async function setValue() {
+            await run("rule value", async () => {
+              const payload = {
+                rule_id: parseNumber(el("set-rule-id").value, -1),
+                value: parseNumber(el("set-rule-value").value, 0),
+              };
+              const enabled = el("set-rule-enabled").value;
+              if (enabled !== "") payload.enabled = enabled;
+              const out = await postForm("/api/rules/value", payload);
+              log("rule_value", out);
+              return out;
+            });
+          }
+
+          return { stageBit, stageRaw, action, list, setValue };
+        })();
+      </script>
+
+      <section class="panel" style="grid-column: 1 / -1;">
+        <h2>Rule Actions + Dynamic Value</h2>
+        <details class="api-help">
+          <summary>API help</summary>
+          <pre class="mono">POST /api/rules  (text/plain body)
+Bodies:
+- apply_commit
+- revert
+- clear_staging
+- clear_rules
+
+GET /api/rules
+Lists active/staged rules.
+
+POST /api/rules/value  (form-url-encoded)
+Fields:
+- rule_id, value
+- enabled (optional)</pre>
+        </details>
+        <div class="row">
+          <button onclick="ssRules.action('apply_commit')">Commit</button>
+          <button class="alt" onclick="ssRules.action('revert')">Revert</button>
+          <button class="warn" onclick="ssRules.action('clear_staging')">Clear Staging</button>
+          <button class="bad" onclick="ssRules.action('clear_rules')">Clear Rules</button>
+          <button class="alt" onclick="ssRules.list()">List Rules</button>
+        </div>
+        <div class="row">
+          <label>Rule ID <input id="set-rule-id" class="mono" value="0" style="width:72px"></label>
+          <label>Value <input id="set-rule-value" class="mono" value="0" style="width:96px"></label>
+          <label>Enable
+            <select id="set-rule-enabled">
+              <option value="">unchanged</option>
+              <option value="1">true</option>
+              <option value="0">false</option>
+            </select>
+          </label>
+          <button onclick="ssRules.setValue()">Set Rule Value</button>
+        </div>
+        <pre id="rules-json" class="mono">{}</pre>
+      </section>
+
+      <section class="panel" style="grid-column: 1 / -1;">
+        <h2>DBC (Upload + Folder Autoload)</h2>
+        <details class="api-help">
+          <summary>API help</summary>
+          <pre class="mono">POST /api/dbc  (text/plain body)
+Body:
+- full DBC text
+
+POST /api/dbc/autoload  (form-url-encoded or empty)
+Reloads from /dbc folder scan order:
+1) /dbc/active.dbc
+2) /dbc/default.dbc
+3) /dbc/vw_pq.dbc
+4) first valid /dbc/*.dbc</pre>
+        </details>
+        <textarea id="dbc-text" placeholder="Paste DBC text here"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button onclick="ssDbc.upload()">Upload DBC Text</button>
+          <button class="alt" onclick="ssDbc.autoload()">Autoload from /dbc folder</button>
+        </div>
+        <p class="hint">Boot already auto-loads <span class="mono">/dbc/active.dbc</span>, <span class="mono">/dbc/default.dbc</span>, <span class="mono">/dbc/vw_pq.dbc</span>, then scans <span class="mono">/dbc/*.dbc</span>.</p>
+      </section>
+      <script>
+        window.ssDbc = (() => {
+          const { el, postText, postForm, log, run } = window.ssUtil;
+
+          async function upload() {
+            await run("dbc upload", async () => {
+              const out = await postText("/api/dbc", el("dbc-text").value);
+              log("dbc_upload", out);
+              return out;
+            });
+          }
+
+          async function autoload() {
+            await run("dbc autoload", async () => {
+              const out = await postForm("/api/dbc/autoload", { action: "autoload" });
+              log("dbc_autoload", out);
+              return out;
+            });
+          }
+
+          return { upload, autoload };
+        })();
+      </script>
+
+      <section class="panel" style="grid-column: 1 / -1;">
+        <h2>Request Log</h2>
+        <pre id="log" class="mono"></pre>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    window.addEventListener("load", async () => {
+      const { run } = window.ssUtil;
+      await run("boot", async () => {
+        await window.ssStatus.refresh();
+        await window.ssFrames.refresh();
+        await window.ssRules.list();
+      });
+
+      setInterval(async () => {
+        if (!window.ssUtil.el("auto-poll").checked) return;
+        await run("auto poll", async () => {
+          await window.ssStatus.refresh();
+          await window.ssFrames.refresh();
+        });
+      }, 1000);
+    });
+  </script>
+</body>
+</html>
