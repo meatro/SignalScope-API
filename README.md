@@ -13,6 +13,10 @@ You do not have to rewrite CAN forwarding, DBC decoding, frame caching, rule sch
 
 An oil-temperature display can be a few lines of browser JavaScript. A tuning interface can publish runtime values into dynamic rules. A controller can add its own state machine through the application-extension API. They all use the same transport and mutation engine.
 
+The complete local interface keeps DBC loading, live-signal discovery, transactional rule building, recording, replay, and the handoff into your own application in one place:
+
+![SignalScope web interface for loading a DBC, exploring live CAN signals, building mutation rules, and creating a custom CAN application](docs/images/signalscope-web-interface.png)
+
 ## Who it is for
 
 SignalScope is intentionally useful at two different depths:
