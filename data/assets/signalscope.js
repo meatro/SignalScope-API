@@ -21,11 +21,16 @@
     "dbcStatus", "dbcFile", "dbcFilename", "loadDbcButton", "autoloadDbcButton",
     "signalSearch", "signalRefresh", "signalRows", "signalTotal", "catalogPage",
     "loadMoreSignals", "frameRows", "frameRefresh", "selectedSignalHelp",
-    "selectedSignal", "ruleCanId", "ruleDirection", "ruleStartBit", "ruleLength",
-    "rulePhysicalValue", "ruleRawValue", "ruleLittleEndian", "encodingHelp",
-    "stageRuleButton", "resetRuleButton", "ruleStateBadge", "ruleRows",
-    "commitRulesButton", "revertRulesButton", "clearRulesButton", "packageText",
-    "savePackageButton", "downloadPackageButton", "loadPackageTextButton",
+    "selectedSignal", "ruleBehavior", "ruleBehaviorHelp", "signalRulePersistence",
+    "ruleCanId", "ruleDirection", "ruleStartBit", "ruleLength", "rulePhysicalValue",
+    "ruleRawValue", "ruleLittleEndian", "encodingHelp", "stageRuleButton",
+    "resetRuleButton", "rawCanId", "rawDirection", "rawFrameStatus", "rawBitGrid",
+    "rawMaskText", "rawValueText", "loadRawFrameButton", "stageRawMaskButton",
+    "clearRawMaskButton", "recipeType", "recipeDescription", "recipeFields",
+    "recipePreview", "recipeNotice", "addRecipeButton", "resetRecipeButton",
+    "ruleStateBadge", "ruleViewBadge", "ruleTableHelp", "ruleRows",
+    "commitRulesButton", "revertRulesButton", "clearDraftButton", "clearRulesButton",
+    "packageEditor", "packageText", "savePackageButton", "downloadPackageButton",
     "copyExampleButton", "oilExample", "logStatus", "startLogButton",
     "stopLogButton", "replayCanId", "replayData", "dryRunButton", "requestLog",
     "toastRegion"
@@ -34,8 +39,13 @@
   const state = {
     online: false,
     status: null,
-    rules: [],
+    candidateRules: [],
+    activeRules: [],
+    candidateDirty: false,
+    rulesInitialized: false,
     ruleEpoch: 0,
+    ruleView: "staging",
+    builderMode: "signal",
     selectedSignal: null,
     catalogSignals: [],
     catalogTotal: 0,
@@ -44,6 +54,9 @@
     dbcText: "",
     dbcFilename: "",
     frameSeen: new Map(),
+    frames: [],
+    rawBitStates: Array(64).fill(-1),
+    rawBaseBytes: null,
     pollBusy: new Set(),
     requestLines: []
   };
@@ -194,6 +207,32 @@
     return id;
   }
 
+  function validateBitRange(startBit, length, littleEndian, maximumLength = 64) {
+    if (!Number.isInteger(startBit) || startBit < 0 || startBit > 63) {
+      throw new Error("Start bit must be between 0 and 63");
+    }
+    if (!Number.isInteger(length) || length < 1 || length > maximumLength) {
+      throw new Error(`Length must be between 1 and ${maximumLength} bits`);
+    }
+    if (littleEndian) {
+      if (startBit + length > 64) {
+        throw new Error("The little-endian field does not fit inside the eight-byte frame");
+      }
+      return;
+    }
+
+    // Match MutationEngine::nextMotorolaBit exactly. Motorola/DBC fields do
+    // not advance linearly at byte boundaries, so start + length is not a
+    // sufficient frame-bounds check.
+    let frameBit = startBit;
+    for (let index = 0; index < length; index += 1) {
+      if (frameBit > 63) {
+        throw new Error("The big-endian field does not fit inside the eight-byte frame");
+      }
+      frameBit = frameBit % 8 === 0 ? frameBit + 15 : frameBit - 1;
+    }
+  }
+
   function updateConnection(online) {
     state.online = online;
     setBadge(dom.connectionBadge, online ? "Connected" : "Offline", online ? "success" : "danger");
@@ -220,11 +259,11 @@
     dom.ruleCountValue.textContent = String(status.active_mutations || 0);
     dom.rulePathValue.textContent = status.rule_package_path || "Memory only";
     const candidateCount = Number(status.staging_mutations || 0);
-    setBadge(
-      dom.ruleStateBadge,
-      candidateCount ? `${candidateCount} candidate rule${candidateCount === 1 ? "" : "s"}` : "Empty candidate",
-      candidateCount ? "warning" : "neutral"
-    );
+    state.candidateDirty = Boolean(status.candidate_dirty);
+    const draftLabel = state.candidateDirty
+      ? `${candidateCount} pending rule${candidateCount === 1 ? "" : "s"}`
+      : Number(status.active_mutations || 0) > 0 ? "Draft matches live" : "No rules";
+    setBadge(dom.ruleStateBadge, draftLabel, state.candidateDirty ? "warning" : "neutral");
 
     const incomingEpoch = Number(status.rule_epoch || 0);
     if (incomingEpoch !== state.ruleEpoch) {
@@ -275,15 +314,16 @@
 
   async function pollFrames() {
     const payload = await api("/api/frame_cache?limit=64", { quiet: true });
+    state.frames = payload.frames || [];
     const now = Date.now();
-    (payload.frames || []).forEach((frame) => {
+    state.frames.forEach((frame) => {
       const key = frameKey(frame);
       const previous = state.frameSeen.get(key);
       if (!previous || previous.timestamp !== frame.timestamp_us) {
         state.frameSeen.set(key, { timestamp: frame.timestamp_us, at: now });
       }
     });
-    renderFrames(payload.frames || []);
+    renderFrames(state.frames);
   }
 
   function signalMetadata(signal) {
@@ -322,7 +362,7 @@
         const canCell = element("td");
         canCell.append(element("code", "", signal.canIdHex || formatCanId(signal.canId)));
         const actionCell = element("td");
-        const useButton = element("button", "button quiet", "Use in rule");
+        const useButton = element("button", "button quiet", "Build rule");
         useButton.type = "button";
         useButton.dataset.useSignal = String(signal.index);
         actionCell.append(useButton);
@@ -385,14 +425,19 @@
       element("small", "", signalMetadata(signal)),
       element("small", "", `factor ${signal.factor} · offset ${signal.offset}`)
     );
-    dom.selectedSignalHelp.textContent = "The DBC supplied this bit location and conversion. Verify its live behavior before applying a rule.";
+    dom.selectedSignalHelp.textContent = "The DBC supplied this bit location and conversion. Verify its decoded value before applying a rule.";
     dom.ruleCanId.value = signal.canIdHex || formatCanId(signal.canId);
     dom.ruleDirection.value = signal.direction || "A_TO_B";
     dom.ruleStartBit.value = signal.startBit;
     dom.ruleLength.value = signal.length;
     dom.ruleLittleEndian.checked = Boolean(signal.littleEndian);
+    dom.rulePhysicalValue.disabled = false;
     if (signal.valid && Number.isFinite(Number(signal.value))) dom.rulePhysicalValue.value = signal.value;
+    dom.rawCanId.value = signal.canIdHex || formatCanId(signal.canId);
+    dom.rawDirection.value = signal.direction || "A_TO_B";
+    seedRecipeTargetFromSignal(signal);
     syncRawFromPhysical();
+    setBuilderMode("signal");
     document.getElementById("rules").scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
@@ -400,6 +445,32 @@
     if (value < minimum) return minimum;
     if (value > maximum) return maximum;
     return value;
+  }
+
+  function clearSelectedSignal(message = "Target edited manually; raw value is now authoritative.") {
+    state.selectedSignal = null;
+    dom.selectedSignal.hidden = true;
+    dom.selectedSignal.replaceChildren();
+    dom.selectedSignalHelp.textContent = "Choose Build rule beside a DBC signal, or use the raw field target below.";
+    dom.rulePhysicalValue.disabled = true;
+    dom.encodingHelp.textContent = message;
+  }
+
+  function clearSignalConversionIfTargetChanged() {
+    const signal = state.selectedSignal;
+    if (!signal) return;
+    let canIdMatches = false;
+    try {
+      canIdMatches = parseCanId(dom.ruleCanId.value) === Number(signal.canId);
+    } catch (error) {
+      // An incomplete manual CAN ID no longer identifies the selected signal.
+    }
+    const stillMatches = canIdMatches &&
+      dom.ruleDirection.value === (signal.direction || "A_TO_B") &&
+      Number(dom.ruleStartBit.value) === Number(signal.startBit) &&
+      Number(dom.ruleLength.value) === Number(signal.length) &&
+      dom.ruleLittleEndian.checked === Boolean(signal.littleEndian);
+    if (!stillMatches) clearSelectedSignal();
   }
 
   /** Encode a DBC physical value into the unsigned bit pattern carried by CAN. */
@@ -450,52 +521,156 @@
     }
   }
 
+  function setBuilderMode(mode) {
+    if (!new Set(["signal", "raw", "package"]).has(mode)) return;
+    state.builderMode = mode;
+    document.querySelectorAll("[data-builder-mode]").forEach((button) => {
+      const selected = button.dataset.builderMode === mode;
+      button.classList.toggle("active", selected);
+      button.setAttribute("aria-selected", selected ? "true" : "false");
+    });
+    document.querySelectorAll("[data-builder-panel]").forEach((panel) => {
+      panel.hidden = panel.dataset.builderPanel !== mode;
+    });
+    if (mode === "raw") renderRawBitGrid();
+    if (mode === "package") updateRecipePreview();
+  }
+
+  function updateRuleBehavior() {
+    const dynamic = dom.ruleBehavior.value === "dynamic";
+    setBadge(dom.signalRulePersistence, dynamic ? "RAM only" : "Package-ready", dynamic ? "warning" : "success");
+    dom.ruleBehaviorHelp.textContent = dynamic
+      ? "A live-adjustable rule starts with this raw value and can be changed from the Draft table. It is limited to 32 bits and is not a .ssrules row."
+      : "A fixed rule can be written to a startup package after you prove it.";
+  }
+
   function resetRuleBuilder() {
     state.selectedSignal = null;
     dom.selectedSignal.hidden = true;
     dom.selectedSignal.replaceChildren();
-    dom.selectedSignalHelp.textContent = "Choose Use in rule beside a DBC signal, or enter the bit location manually.";
+    dom.selectedSignalHelp.textContent = "Choose Build rule beside a DBC signal, or open the frame target and enter its bit location manually.";
+    dom.ruleBehavior.value = "static";
     dom.ruleCanId.value = "0x321";
     dom.ruleDirection.value = "A_TO_B";
     dom.ruleStartBit.value = "0";
     dom.ruleLength.value = "8";
     dom.rulePhysicalValue.value = "90";
+    dom.rulePhysicalValue.disabled = true;
     dom.ruleRawValue.value = "130";
     dom.ruleLittleEndian.checked = true;
-    dom.encodingHelp.textContent = "No DBC signal selected; raw value is used directly.";
+    dom.encodingHelp.textContent = "No DBC signal selected; enter the raw integer carried by the CAN field.";
+    updateRuleBehavior();
   }
 
   function ruleFormValues() {
     const canId = parseCanId(dom.ruleCanId.value);
     const startBit = Number(dom.ruleStartBit.value);
     const length = Number(dom.ruleLength.value);
-    if (!Number.isInteger(startBit) || startBit < 0 || startBit > 63) throw new Error("Start bit must be between 0 and 63");
-    if (!Number.isInteger(length) || length < 1 || length > 64 || (dom.ruleLittleEndian.checked && startBit + length > 64)) {
-      throw new Error("The selected bit range must fit inside an 8-byte CAN frame");
-    }
+    const dynamic = dom.ruleBehavior.value === "dynamic";
+    validateBitRange(startBit, length, dom.ruleLittleEndian.checked);
+    if (dynamic && length > 32) throw new Error("Live-adjustable rules are limited to 32 bits");
     let raw;
     try {
       raw = BigInt(dom.ruleRawValue.value.trim());
     } catch (error) {
-      throw new Error("Raw value must be a whole number");
+      throw new Error("CAN raw value must be a whole number");
     }
     const maximum = (1n << BigInt(length)) - 1n;
-    if (raw < 0n || raw > maximum) throw new Error(`Raw value must fit in ${length} bits`);
+    if (raw < 0n || raw > maximum) throw new Error(`CAN raw value must fit in ${length} bits`);
     return {
       canId,
       direction: dom.ruleDirection.value,
       startBit,
       length,
       littleEndian: dom.ruleLittleEndian.checked,
+      dynamic,
       raw: raw.toString()
     };
   }
 
+  function packageHeader() {
+    return "# SignalScope rule package\n# Generated in the Rule workstation; review before installing.";
+  }
+
+  function packageRowIdentity(line) {
+    const fields = String(line).split(",").map((field) => field.trim());
+    const type = fields[0];
+    if (!type || type.startsWith("#")) return "";
+    if (type === "STATIC") return fields.length >= 6 ? `BIT_RANGE_STATIC,${fields.slice(1, 6).join(",")}` : "";
+    if (type === "SOURCE_INT" || type === "SOURCE_SELECT_INT") {
+      // Both compile to the same dynamic BIT_RANGE identity. The guided editor
+      // must visibly replace one with the other just as the firmware does.
+      return fields.length >= 6 ? `BIT_RANGE_SOURCE,${fields.slice(1, 6).join(",")}` : "";
+    }
+    if (type === "COUNTER" || type === "SEQUENCE8") {
+      return fields.length >= 6 ? fields.slice(0, 6).join(",") : "";
+    }
+    if (["CHECKSUM_XOR", "CHECKSUM_CRC8_AUTOSAR"].includes(type)) {
+      return fields.length >= 4 ? fields.slice(0, 4).join(",") : "";
+    }
+    // BIND_* directives are positional state changes, not engine rules. Two
+    // directives with the same names can intentionally define different
+    // scopes later in one package, so they must never be deduplicated here.
+    return "";
+  }
+
+  function insertPackageBinding(lines, line) {
+    const fields = String(line).split(",").map((field) => field.trim());
+    const type = fields[0];
+    let insertAt = lines.length;
+
+    if (type === "BIND_TABLE" || type === "BIND_OVERRIDE") {
+      const source = fields[1];
+      const matchingSource = lines.findIndex((current) => {
+        const row = String(current).split(",").map((field) => field.trim());
+        return (row[0] === "SOURCE_INT" || row[0] === "SOURCE_SELECT_INT") && row[6] === source;
+      });
+      if (matchingSource >= 0) insertAt = matchingSource;
+    } else if (type === "BIND_ACTIVE") {
+      const firstRule = lines.findIndex((current) => {
+        const rowType = String(current).split(",", 1)[0].trim();
+        return rowType && !rowType.startsWith("#") && !rowType.startsWith("BIND_");
+      });
+      if (firstRule >= 0) insertAt = firstRule;
+    }
+
+    // Insert only the new directive. Existing directives stay byte-for-byte
+    // and position-for-position intact so expert-authored scopes are safe.
+    lines.splice(insertAt, 0, line);
+  }
+
+  function upsertPackageLine(line) {
+    const identity = packageRowIdentity(line);
+    const existing = dom.packageText.value.trim()
+      ? dom.packageText.value.trimEnd().split(/\r?\n/)
+      : packageHeader().split("\n");
+    const rowType = String(line).split(",", 1)[0].trim();
+    if (rowType.startsWith("BIND_")) {
+      insertPackageBinding(existing, line);
+      dom.packageText.value = `${existing.join("\n")}\n`;
+      return;
+    }
+    let lastMatch = -1;
+    if (identity) {
+      existing.forEach((current, index) => {
+        if (packageRowIdentity(current) === identity) lastMatch = index;
+      });
+    }
+    const next = [];
+    existing.forEach((current, index) => {
+      // The engine reserves sequence at the first matching row but keeps the
+      // content and positional bindings from the last. Replace only that last
+      // row; retaining earlier duplicates preserves both pieces of semantics.
+      next.push(index === lastMatch ? line : current);
+    });
+    if (lastMatch < 0) next.push(line);
+    dom.packageText.value = `${next.join("\n")}\n`;
+  }
+
   function appendRuleToPackage(rule) {
-    const line = `STATIC,${formatCanId(rule.canId)},${rule.direction},${rule.startBit},${rule.length},${rule.littleEndian ? 1 : 0},${rule.raw}`;
-    const current = dom.packageText.value.trimEnd();
-    const header = "# SignalScope rule package\n# kind,can_id,direction,start_bit,length,little_endian,raw_value";
-    dom.packageText.value = `${current || header}\n${line}\n`;
+    upsertPackageLine(
+      `STATIC,${formatCanId(rule.canId)},${rule.direction},${rule.startBit},${rule.length},${rule.littleEndian ? 1 : 0},${rule.raw}`
+    );
   }
 
   async function stageRule() {
@@ -507,15 +682,469 @@
       start_bit: rule.startBit,
       length: rule.length,
       little_endian: rule.littleEndian ? 1 : 0,
-      dynamic: 0,
+      dynamic: rule.dynamic ? 1 : 0,
       replace_value: rule.raw,
       enabled: 1
     });
     state.ruleEpoch = Number(payload.rule_epoch || state.ruleEpoch);
-    appendRuleToPackage(rule);
-    await refreshRules();
-    await pollStatus();
-    showToast("Rule added to candidate", "Review it, then choose Apply now to change the live pipeline.", "success");
+    if (!rule.dynamic) appendRuleToPackage(rule);
+    state.ruleView = "staging";
+    await Promise.all([refreshRules(), pollStatus()]);
+    showToast(
+      rule.dynamic ? "Live-adjustable rule added to draft" : "Fixed rule added to draft",
+      rule.dynamic
+        ? "This rule lives in RAM; use the value control in the Draft table to tune it."
+        : "Its matching STATIC row is also ready in the startup package source.",
+      "success"
+    );
+  }
+
+  function rawMaskBytes() {
+    const mask = Array(8).fill(0);
+    const value = Array(8).fill(0);
+    state.rawBitStates.forEach((bitState, index) => {
+      if (bitState < 0) return;
+      const byteIndex = Math.floor(index / 8);
+      const bitIndex = index % 8;
+      mask[byteIndex] |= 1 << bitIndex;
+      if (bitState === 1) value[byteIndex] |= 1 << bitIndex;
+    });
+    return { mask, value };
+  }
+
+  function bytesToHex(bytes) {
+    return bytes.map((byte) => Number(byte).toString(16).toUpperCase().padStart(2, "0")).join("");
+  }
+
+  function renderRawBitGrid() {
+    const { mask, value } = rawMaskBytes();
+    dom.rawMaskText.value = bytesToHex(mask);
+    dom.rawValueText.value = bytesToHex(value);
+    dom.rawBitGrid.replaceChildren();
+
+    for (let byteIndex = 0; byteIndex < 8; byteIndex += 1) {
+      const row = element("div", "byte-row");
+      const label = element("div", "byte-label");
+      label.append(element("strong", "", `Byte ${byteIndex}`));
+      const before = state.rawBaseBytes ? state.rawBaseBytes[byteIndex] : null;
+      const after = before === null ? null : ((before & (~mask[byteIndex] & 0xff)) | (value[byteIndex] & mask[byteIndex]));
+      label.append(element("small", "", before === null ? "-- → --" : `${before.toString(16).toUpperCase().padStart(2, "0")} → ${after.toString(16).toUpperCase().padStart(2, "0")}`));
+      row.append(label);
+
+      const bits = element("div", "byte-bits");
+      for (let bitIndex = 7; bitIndex >= 0; bitIndex -= 1) {
+        const index = byteIndex * 8 + bitIndex;
+        const bitState = state.rawBitStates[index];
+        const button = element("button", `bit-state ${bitState < 0 ? "pass" : bitState === 0 ? "zero" : "one"}`, bitState < 0 ? "·" : String(bitState));
+        button.type = "button";
+        button.dataset.rawBit = String(index);
+        button.setAttribute("aria-label", `Byte ${byteIndex} bit ${bitIndex}: ${bitState < 0 ? "pass through" : `force ${bitState}`}`);
+        button.title = `Bit ${bitIndex}: ${bitState < 0 ? "pass through" : `force ${bitState}`}`;
+        bits.append(button);
+      }
+      row.append(bits);
+      dom.rawBitGrid.append(row);
+    }
+  }
+
+  function cycleRawBit(index) {
+    const current = state.rawBitStates[index];
+    state.rawBitStates[index] = current < 0 ? 1 : current === 1 ? 0 : -1;
+    renderRawBitGrid();
+  }
+
+  function resetRawMask() {
+    state.rawBitStates.fill(-1);
+    state.rawBaseBytes = null;
+    dom.rawFrameStatus.textContent = "No source frame loaded.";
+    renderRawBitGrid();
+  }
+
+  function parseFrameBytes(data) {
+    const bytes = String(data || "").trim().split(/[\s,]+/).filter(Boolean);
+    if (!bytes.length || bytes.some((byte) => !/^[0-9a-f]{2}$/i.test(byte))) return null;
+    const parsed = bytes.slice(0, 8).map((byte) => Number.parseInt(byte, 16));
+    while (parsed.length < 8) parsed.push(0);
+    return parsed;
+  }
+
+  function useLatestRawFrame() {
+    const canId = parseCanId(dom.rawCanId.value);
+    const direction = dom.rawDirection.value;
+    const frame = state.frames.find((entry) => Number(entry.can_id) === canId && entry.direction === direction);
+    const bytes = frame && parseFrameBytes(frame.data);
+    if (!frame || !bytes) throw new Error(`No cached ${formatCanId(canId)} frame exists on ${direction}`);
+    state.rawBaseBytes = bytes;
+    dom.rawFrameStatus.textContent = `${formatCanId(canId)} · ${direction} · DLC ${frame.dlc ?? "--"}`;
+    renderRawBitGrid();
+  }
+
+  async function stageRawMask() {
+    const canId = parseCanId(dom.rawCanId.value);
+    const { mask, value } = rawMaskBytes();
+    if (mask.every((byte) => byte === 0)) throw new Error("Choose at least one bit to force to zero or one");
+    const payload = await postForm("/api/rules/stage", {
+      rule_kind: "RAW_MASK",
+      can_id: formatCanId(canId),
+      direction: dom.rawDirection.value,
+      mask: bytesToHex(mask),
+      value: bytesToHex(value),
+      enabled: 1
+    });
+    state.ruleEpoch = Number(payload.rule_epoch || state.ruleEpoch);
+    state.ruleView = "staging";
+    await Promise.all([refreshRules(), pollStatus()]);
+    showToast("Raw mask added to draft", "It can be applied live for this session; the package format does not persist raw masks yet.", "success");
+  }
+
+  const recipeDefinitions = {
+    COUNTER: {
+      description: "Write a field that advances once for every matching frame, then wraps at a defined value.",
+      fields: [
+        { name: "can_id", label: "CAN ID", value: "0x321" },
+        { name: "direction", label: "Frame path", control: "select", value: "A_TO_B", options: [["A_TO_B", "Bus A → Bus B"], ["B_TO_A", "Bus B → Bus A"]] },
+        { name: "start_bit", label: "Start bit", type: "number", value: "8", min: 0, max: 63 },
+        { name: "length", label: "Length", type: "number", value: "4", min: 1, max: 32 },
+        { name: "little_endian", label: "Bit order", control: "select", value: "1", options: [["1", "Intel / little-endian"], ["0", "Motorola / big-endian"]] },
+        { name: "initial", label: "Initial value", type: "number", value: "0", min: 0 },
+        { name: "step", label: "Step per frame", type: "number", value: "1", min: 0 },
+        { name: "wrap_after", label: "Wrap after", type: "number", value: "15", min: 0 },
+        { name: "wrap_to", label: "Wrap to", type: "number", value: "0", min: 0 }
+      ]
+    },
+    SEQUENCE8: {
+      description: "Cycle through one to sixteen byte values as matching frames pass through.",
+      fields: [
+        { name: "can_id", label: "CAN ID", value: "0x321" },
+        { name: "direction", label: "Frame path", control: "select", value: "A_TO_B", options: [["A_TO_B", "Bus A → Bus B"], ["B_TO_A", "Bus B → Bus A"]] },
+        { name: "start_bit", label: "Start bit", type: "number", value: "16", min: 0, max: 63 },
+        { name: "length", label: "Length", type: "number", value: "8", min: 1, max: 8 },
+        { name: "little_endian", label: "Bit order", control: "select", value: "1", options: [["1", "Intel / little-endian"], ["0", "Motorola / big-endian"]] },
+        { name: "values", label: "Sequence values", value: "0x10 | 0x20 | 0x30", wide: true, help: "One to sixteen byte values separated by |, spaces, or commas." },
+        { name: "initial_index", label: "Initial index", type: "number", value: "0", min: 0, max: 15 }
+      ]
+    },
+    CHECKSUM_XOR: {
+      description: "XOR an inclusive payload byte range and write the result into one target byte.",
+      fields: [
+        { name: "can_id", label: "CAN ID", value: "0x321" },
+        { name: "direction", label: "Frame path", control: "select", value: "A_TO_B", options: [["A_TO_B", "Bus A → Bus B"], ["B_TO_A", "Bus B → Bus A"]] },
+        { name: "target_byte", label: "Target byte", type: "number", value: "7", min: 0, max: 7 },
+        { name: "start_byte", label: "Range starts at byte", type: "number", value: "0", min: 0, max: 7 },
+        { name: "end_byte", label: "Range ends at byte", type: "number", value: "6", min: 0, max: 7 },
+        { name: "seed", label: "XOR seed", value: "0x00" },
+        { name: "enabled", label: "Initial state", control: "select", value: "1", options: [["1", "Enabled"], ["0", "Disabled"]] }
+      ]
+    },
+    CHECKSUM_CRC8_AUTOSAR: {
+      description: "Apply SignalScope's specialized CRC-8/AUTOSAR data-ID post-processor.",
+      notice: "Use this only when captures or protocol documentation prove the exact CRC profile, byte range, counter byte, and 16-byte data-ID table.",
+      fields: [
+        { name: "can_id", label: "CAN ID", value: "0x321" },
+        { name: "direction", label: "Frame path", control: "select", value: "A_TO_B", options: [["A_TO_B", "Bus A → Bus B"], ["B_TO_A", "Bus B → Bus A"]] },
+        { name: "target_byte", label: "CRC target byte", type: "number", value: "0", min: 0, max: 7 },
+        { name: "counter_byte", label: "Counter byte", type: "number", value: "1", min: 0, max: 7 },
+        { name: "start_byte", label: "Range starts at byte", type: "number", value: "1", min: 0, max: 7 },
+        { name: "end_byte", label: "Range ends at byte", type: "number", value: "7", min: 0, max: 7 },
+        { name: "data_ids", label: "16 data-ID bytes", value: "00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F", wide: true, help: "Exactly sixteen hexadecimal bytes in counter-nibble order. Prefix an explicit decimal value with 0d." },
+        { name: "enabled", label: "Initial state", control: "select", value: "1", options: [["1", "Enabled"], ["0", "Disabled"]] }
+      ]
+    },
+    SOURCE_INT: {
+      description: "Map a value published by an installed native application into a CAN field.",
+      notice: "The source name must be registered by your app's C++ extension. BIND_TABLE, BIND_OVERRIDE, and BIND_ACTIVE directives affect compatible rows below their position in the package.",
+      fields: [
+        { name: "can_id", label: "CAN ID", value: "0x321" },
+        { name: "direction", label: "Frame path", control: "select", value: "A_TO_B", options: [["A_TO_B", "Bus A → Bus B"], ["B_TO_A", "Bus B → Bus A"]] },
+        { name: "start_bit", label: "Start bit", type: "number", value: "0", min: 0, max: 63 },
+        { name: "length", label: "Length", type: "number", value: "8", min: 1, max: 32 },
+        { name: "little_endian", label: "Bit order", control: "select", value: "1", options: [["1", "Intel / little-endian"], ["0", "Motorola / big-endian"]] },
+        { name: "value_source", label: "Runtime source name", value: "app_value" },
+        { name: "source_gain", label: "Source gain", type: "number", step: "any", value: "1" },
+        { name: "source_offset", label: "Source offset", type: "number", step: "any", value: "0" },
+        { name: "output_scale", label: "Output scale", type: "number", step: "any", value: "1" },
+        { name: "output_offset", label: "Output offset", type: "number", step: "any", value: "0" },
+        { name: "zero_threshold", label: "Zero threshold", type: "number", step: "any", value: "0" },
+        { name: "zero_output", label: "Zero output", type: "number", value: "0", min: 0 },
+        { name: "full_threshold", label: "Full threshold", type: "number", step: "any", value: "255" },
+        { name: "full_output", label: "Full output", type: "number", value: "255", min: 0 }
+      ]
+    },
+    SOURCE_SELECT_INT: {
+      description: "Use an application-published mode to choose a direct value or a mode-specific scale.",
+      notice: "Both source names must be registered by your app's C++ extension. Selector entries use D for direct output or S for scale plus full output. Package bindings affect compatible rows below their position.",
+      fields: [
+        { name: "can_id", label: "CAN ID", value: "0x321" },
+        { name: "direction", label: "Frame path", control: "select", value: "A_TO_B", options: [["A_TO_B", "Bus A → Bus B"], ["B_TO_A", "Bus B → Bus A"]] },
+        { name: "start_bit", label: "Start bit", type: "number", value: "0", min: 0, max: 63 },
+        { name: "length", label: "Length", type: "number", value: "8", min: 1, max: 32 },
+        { name: "little_endian", label: "Bit order", control: "select", value: "1", options: [["1", "Intel / little-endian"], ["0", "Motorola / big-endian"]] },
+        { name: "value_source", label: "Runtime source name", value: "requested_value" },
+        { name: "source_gain", label: "Source gain", type: "number", step: "any", value: "1" },
+        { name: "source_offset", label: "Source offset", type: "number", step: "any", value: "0" },
+        { name: "output_offset", label: "Output offset", type: "number", step: "any", value: "0" },
+        { name: "zero_threshold", label: "Zero threshold", type: "number", step: "any", value: "0" },
+        { name: "zero_output", label: "Zero output", type: "number", value: "0", min: 0 },
+        { name: "full_threshold", label: "Full threshold", type: "number", step: "any", value: "100" },
+        { name: "selector_source", label: "Mode source name", value: "mode" },
+        { name: "entries", label: "Selector entries", value: "0:D:0 | 1:S:1:100 | 2:S:2:200", wide: true, help: "Examples: 0:D:0 or 1:S:1.5:200. Omitted modes disable the rule." }
+      ]
+    },
+    BIND_TABLE: {
+      description: "Attach an application-published lookup table to later app-driven rows using this source.",
+      notice: "Bindings are positional. This directive is inserted before the first matching app-driven row and remains in effect until a later BIND_TABLE changes it. Move or repeat it in the package source for narrower scopes. Your app code must publish both names.",
+      fields: [
+        { name: "value_source", label: "Runtime source name", value: "app_value" },
+        { name: "table_name", label: "Runtime table name", value: "app_table" }
+      ]
+    },
+    BIND_OVERRIDE: {
+      description: "Choose a second published value whenever an application-published enable source is active.",
+      notice: "Bindings are positional. This directive is inserted before the first matching app-driven row and remains in effect until a later BIND_OVERRIDE changes it. Move or repeat it in the package source for narrower scopes. Your app code must publish all three names.",
+      fields: [
+        { name: "value_source", label: "Primary source", value: "app_value" },
+        { name: "active_source", label: "Override-enable source", value: "override_active" },
+        { name: "override_source", label: "Override-value source", value: "override_value" }
+      ]
+    },
+    BIND_ACTIVE: {
+      description: "Run generated rules only while a published selector is in one of these modes.",
+      notice: "This directive is inserted before the first rule and gates compatible rows below it until a later BIND_ACTIVE replaces the gate for following rows. Mode-selecting source rules keep their own selector. Your app code must publish a value from 0 through 15.",
+      fields: [
+        { name: "selector_source", label: "Mode source name", value: "mode" },
+        { name: "states", label: "Active modes", value: "0 | 1 | 4", help: "One or more unique values from 0 through 15." }
+      ]
+    }
+  };
+
+  function recipeControl(field) {
+    let control;
+    if (field.control === "select") {
+      control = element("select");
+      field.options.forEach(([value, label]) => {
+        const option = element("option", "", label);
+        option.value = value;
+        control.append(option);
+      });
+    } else {
+      control = element("input");
+      control.type = field.type || "text";
+      if (field.min !== undefined) control.min = String(field.min);
+      if (field.max !== undefined) control.max = String(field.max);
+      if (field.step !== undefined) control.step = String(field.step);
+    }
+    control.value = field.value;
+    control.dataset.recipeField = field.name;
+    return control;
+  }
+
+  function renderRecipeFields() {
+    const definition = recipeDefinitions[dom.recipeType.value];
+    dom.recipeDescription.textContent = definition.description;
+    dom.recipeNotice.innerHTML = "";
+    dom.recipeNotice.append(element("strong", "", "Know what feeds the rule. "), document.createTextNode(definition.notice || "This row is package source. Installing the package validates it, replaces the live table, and stores it for boot."));
+    dom.recipeFields.replaceChildren();
+    definition.fields.forEach((field) => {
+      const label = element("label", `field${field.wide ? " span-2" : ""}`);
+      label.append(element("span", "", field.label));
+      label.append(recipeControl(field));
+      if (field.help) label.append(element("small", "field-help", field.help));
+      dom.recipeFields.append(label);
+    });
+    if (state.selectedSignal) seedRecipeTargetFromSignal(state.selectedSignal);
+    updateRecipePreview();
+  }
+
+  function seedRecipeTargetFromSignal(signal) {
+    const values = {
+      can_id: signal.canIdHex || formatCanId(signal.canId),
+      direction: signal.direction || "A_TO_B",
+      start_bit: signal.startBit,
+      length: signal.length,
+      little_endian: signal.littleEndian ? 1 : 0
+    };
+    Object.entries(values).forEach(([name, value]) => {
+      const input = dom.recipeFields.querySelector(`[data-recipe-field="${name}"]`);
+      if (input) input.value = String(value);
+    });
+    updateRecipePreview();
+  }
+
+  function recipeValues() {
+    const values = {};
+    dom.recipeFields.querySelectorAll("[data-recipe-field]").forEach((control) => {
+      values[control.dataset.recipeField] = control.value.trim();
+    });
+    return values;
+  }
+
+  function integerField(values, name, label, minimum = 0, maximum = 0xffffffff) {
+    const text = values[name] || "";
+    if (!/^(?:0x[0-9a-f]+|[0-9]+)$/i.test(text)) throw new Error(`${label} must be a whole number`);
+    const value = Number(text);
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+      throw new Error(`${label} must be between ${minimum} and ${maximum}`);
+    }
+    return value;
+  }
+
+  function floatField(values, name, label) {
+    const text = String(values[name] ?? "").trim();
+    if (!text) throw new Error(`${label} is required`);
+    const value = Number(text);
+    if (!Number.isFinite(value)) throw new Error(`${label} must be a number`);
+    return String(value);
+  }
+
+  function sourceName(values, name, label) {
+    const value = String(values[name] || "").trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_.-]{0,30}$/.test(value)) {
+      throw new Error(`${label} must start with a letter or underscore and use only letters, numbers, _, ., or - (31 characters maximum)`);
+    }
+    return value;
+  }
+
+  function commonRecipeFields(values, maximumLength) {
+    const canId = formatCanId(parseCanId(values.can_id));
+    const direction = values.direction;
+    if (direction !== "A_TO_B" && direction !== "B_TO_A") throw new Error("Choose a valid frame path");
+    const startBit = integerField(values, "start_bit", "Start bit", 0, 63);
+    const length = integerField(values, "length", "Length", 1, maximumLength);
+    const littleEndian = values.little_endian === "0" ? 0 : 1;
+    validateBitRange(startBit, length, littleEndian === 1, maximumLength);
+    return { canId, direction, startBit, length, littleEndian };
+  }
+
+  function splitList(text) {
+    return String(text).trim().split(/[|,\s]+/).filter(Boolean);
+  }
+
+  function buildRecipeRow() {
+    const type = dom.recipeType.value;
+    const values = recipeValues();
+
+    if (type === "COUNTER") {
+      const common = commonRecipeFields(values, 32);
+      const maximum = Number((1n << BigInt(common.length)) - 1n);
+      const initial = integerField(values, "initial", "Initial value", 0, maximum);
+      const step = integerField(values, "step", "Step", 0, 0xffffffff);
+      const wrapAfter = integerField(values, "wrap_after", "Wrap after", 0, maximum);
+      const wrapTo = integerField(values, "wrap_to", "Wrap to", 0, maximum);
+      return `COUNTER,${common.canId},${common.direction},${common.startBit},${common.length},${common.littleEndian},${initial},${step},${wrapAfter},${wrapTo}`;
+    }
+
+    if (type === "SEQUENCE8") {
+      const common = commonRecipeFields(values, 8);
+      const maximum = (1 << common.length) - 1;
+      const sequence = splitList(values.values).map((value, index) => {
+        const entry = { value };
+        return integerField(entry, "value", `Sequence value ${index + 1}`, 0, maximum);
+      });
+      if (!sequence.length || sequence.length > 16) throw new Error("Sequence must contain 1–16 values");
+      const initialIndex = integerField(values, "initial_index", "Initial index", 0, sequence.length - 1);
+      return `SEQUENCE8,${common.canId},${common.direction},${common.startBit},${common.length},${common.littleEndian},${sequence.join("|")},${initialIndex}`;
+    }
+
+    if (type === "CHECKSUM_XOR") {
+      const canId = formatCanId(parseCanId(values.can_id));
+      const target = integerField(values, "target_byte", "Target byte", 0, 7);
+      const start = integerField(values, "start_byte", "Start byte", 0, 7);
+      const end = integerField(values, "end_byte", "End byte", start, 7);
+      const seed = integerField(values, "seed", "Seed", 0, 255);
+      return `CHECKSUM_XOR,${canId},${values.direction},${target},${start},${end},0x${seed.toString(16).toUpperCase().padStart(2, "0")},${values.enabled === "0" ? 0 : 1}`;
+    }
+
+    if (type === "CHECKSUM_CRC8_AUTOSAR") {
+      const canId = formatCanId(parseCanId(values.can_id));
+      const target = integerField(values, "target_byte", "Target byte", 0, 7);
+      const counter = integerField(values, "counter_byte", "Counter byte", 0, 7);
+      const start = integerField(values, "start_byte", "Start byte", 0, 7);
+      const end = integerField(values, "end_byte", "End byte", start, 7);
+      const dataIds = splitList(values.data_ids).map((value, index) => {
+        // Unprefixed two-digit values are intentionally interpreted as hex in
+        // this byte-oriented field; explicit decimal remains available as 0dNN.
+        const normalized = /^0d[0-9]+$/i.test(value)
+          ? value.slice(2)
+          : /^0x/i.test(value) ? value : `0x${value}`;
+        const entry = { value: normalized };
+        return integerField(entry, "value", `Data ID ${index}`, 0, 255);
+      });
+      if (dataIds.length !== 16) throw new Error("Enter exactly 16 data-ID bytes");
+      const encoded = dataIds.map((value) => `0x${value.toString(16).toUpperCase().padStart(2, "0")}`).join("|");
+      return `CHECKSUM_CRC8_AUTOSAR,${canId},${values.direction},${target},${counter},${start},${end},${encoded},${values.enabled === "0" ? 0 : 1}`;
+    }
+
+    if (type === "SOURCE_INT") {
+      const common = commonRecipeFields(values, 32);
+      const source = sourceName(values, "value_source", "Runtime source name");
+      const zeroOutput = integerField(values, "zero_output", "Zero output", 0, 0xffffffff);
+      const fullOutput = integerField(values, "full_output", "Full output", 0, 0xffffffff);
+      return `SOURCE_INT,${common.canId},${common.direction},${common.startBit},${common.length},${common.littleEndian},${source},${floatField(values, "source_gain", "Source gain")},${floatField(values, "source_offset", "Source offset")},${floatField(values, "output_scale", "Output scale")},${floatField(values, "output_offset", "Output offset")},${floatField(values, "zero_threshold", "Zero threshold")},${zeroOutput},${floatField(values, "full_threshold", "Full threshold")},${fullOutput}`;
+    }
+
+    if (type === "SOURCE_SELECT_INT") {
+      const common = commonRecipeFields(values, 32);
+      const source = sourceName(values, "value_source", "Runtime source name");
+      const selector = sourceName(values, "selector_source", "Mode source name");
+      const zeroOutput = integerField(values, "zero_output", "Zero output", 0, 0xffffffff);
+      const seen = new Set();
+      const entries = String(values.entries).split("|").map((entry) => entry.trim()).filter(Boolean).map((entry) => {
+        const parts = entry.split(":").map((part) => part.trim());
+        const selectorValue = Number(parts[0]);
+        if (!Number.isInteger(selectorValue) || selectorValue < 0 || selectorValue > 15 || seen.has(selectorValue)) {
+          throw new Error("Selector entries need unique mode values from 0 through 15");
+        }
+        seen.add(selectorValue);
+        if (parts[1] === "D" && parts.length === 3) {
+          const direct = integerField({ value: parts[2] }, "value", `Direct output for mode ${selectorValue}`, 0, 0xffffffff);
+          return `${selectorValue}:D:${direct}`;
+        }
+        if (parts[1] === "S" && parts.length === 4) {
+          const scale = floatField({ value: parts[2] }, "value", `Scale for mode ${selectorValue}`);
+          const full = integerField({ value: parts[3] }, "value", `Full output for mode ${selectorValue}`, 0, 0xffffffff);
+          return `${selectorValue}:S:${scale}:${full}`;
+        }
+        throw new Error("Use selector entries such as 0:D:0 or 1:S:1.5:200");
+      });
+      if (!entries.length) throw new Error("Add at least one selector entry");
+      return `SOURCE_SELECT_INT,${common.canId},${common.direction},${common.startBit},${common.length},${common.littleEndian},${source},${floatField(values, "source_gain", "Source gain")},${floatField(values, "source_offset", "Source offset")},${floatField(values, "output_offset", "Output offset")},${floatField(values, "zero_threshold", "Zero threshold")},${zeroOutput},${floatField(values, "full_threshold", "Full threshold")},${selector},${entries.join("|")}`;
+    }
+
+    if (type === "BIND_TABLE") {
+      return `BIND_TABLE,${sourceName(values, "value_source", "Runtime source name")},${sourceName(values, "table_name", "Runtime table name")}`;
+    }
+    if (type === "BIND_OVERRIDE") {
+      return `BIND_OVERRIDE,${sourceName(values, "value_source", "Primary source")},${sourceName(values, "active_source", "Override-enable source")},${sourceName(values, "override_source", "Override-value source")}`;
+    }
+    if (type === "BIND_ACTIVE") {
+      const selector = sourceName(values, "selector_source", "Mode source name");
+      const states = [...new Set(splitList(values.states).map((value, index) => {
+        const entry = { value };
+        return integerField(entry, "value", `Active mode ${index + 1}`, 0, 15);
+      }))].sort((a, b) => a - b);
+      if (!states.length) throw new Error("Add at least one active mode");
+      return `BIND_ACTIVE,${selector},${states.join("|")}`;
+    }
+    throw new Error("Choose a supported recipe type");
+  }
+
+  function updateRecipePreview() {
+    try {
+      dom.recipePreview.textContent = buildRecipeRow();
+      dom.recipePreview.classList.remove("invalid");
+      dom.addRecipeButton.disabled = false;
+    } catch (error) {
+      dom.recipePreview.textContent = error.message;
+      dom.recipePreview.classList.add("invalid");
+      dom.addRecipeButton.disabled = true;
+    }
+  }
+
+  function addRecipeToPackage() {
+    const line = buildRecipeRow();
+    upsertPackageLine(line);
+    dom.packageEditor.open = true;
+    showToast("Recipe row added", `${dom.recipeType.options[dom.recipeType.selectedIndex].text} is ready in the package source.`, "success");
   }
 
   // JSON numbers stop being exact above 53 bits in a browser. The framework
@@ -528,25 +1157,35 @@
     return String(rule.replace_value ?? 0);
   }
 
+  function exactRuntimeValue(rule) {
+    if (typeof rule.runtime_value_text === "string" && rule.runtime_value_text.trim()) {
+      return rule.runtime_value_text.trim();
+    }
+    if (rule.runtime_value !== undefined) return String(rule.runtime_value);
+    return exactRuleValue(rule);
+  }
+
   function renderRules() {
+    const viewingDraft = state.ruleView === "staging";
+    const rules = viewingDraft ? state.candidateRules : state.activeRules;
     dom.ruleRows.replaceChildren();
-    if (!state.rules.length) {
+    if (!rules.length) {
       const row = element("tr");
-      const cell = element("td", "empty", "No rules loaded.");
+      const cell = element("td", "empty", viewingDraft ? "No draft rules." : "No live rules.");
       cell.colSpan = 4;
       row.append(cell);
       dom.ruleRows.append(row);
       return;
     }
 
-    state.rules.forEach((rule) => {
+    rules.forEach((rule) => {
       const row = element("tr");
       const idCell = element("td");
       idCell.append(element("code", "", `#${rule.rule_id}`));
       const target = element("td");
-      const targetText = rule.kind === "RAW_MASK"
-        ? `${formatCanId(rule.can_id)} raw mask`
-        : `${formatCanId(rule.can_id)} bit ${rule.start_bit}:${rule.length}`;
+      let targetText = `${formatCanId(rule.can_id)} bit ${rule.start_bit}:${rule.length}`;
+      if (rule.kind === "RAW_MASK") targetText = `${formatCanId(rule.can_id)} raw bits`;
+      if (String(rule.kind).startsWith("CHECKSUM")) targetText = `${formatCanId(rule.can_id)} checksum`;
       target.append(element("span", "signal-name"));
       target.firstChild.append(
         element("strong", "", targetText),
@@ -554,72 +1193,172 @@
       );
 
       const valueCell = element("td", "rule-value-control");
-      if (rule.kind === "BIT_RANGE" && rule.dynamic) {
+      const manualDynamic = rule.kind === "BIT_RANGE" && rule.dynamic &&
+        rule.manual_dynamic !== false && !String(rule.value_source || "").trim();
+      const counterControl = rule.kind === "COUNTER";
+      const sequenceControl = rule.kind === "SEQUENCE8";
+      const runtimeControl = manualDynamic || counterControl || sequenceControl;
+      if (runtimeControl && viewingDraft) {
         const valueInput = element("input");
         valueInput.type = "number";
         valueInput.min = "0";
-        valueInput.value = exactRuleValue(rule);
+        if (sequenceControl && Number(rule.sequence_count) > 0) {
+          valueInput.max = String(Number(rule.sequence_count) - 1);
+        } else if (Number(rule.length) > 0 && Number(rule.length) < 32) {
+          valueInput.max = String((2 ** Number(rule.length)) - 1);
+        }
+        valueInput.value = exactRuntimeValue(rule);
         valueInput.dataset.ruleValue = String(rule.rule_id);
-        valueInput.setAttribute("aria-label", `Raw value for rule ${rule.rule_id}`);
+        const runtimeLabel = counterControl ? "Counter state" : sequenceControl ? "Sequence index" : "Raw value";
+        valueInput.setAttribute("aria-label", `${runtimeLabel} for rule ${rule.rule_id}`);
         const setButton = element("button", "button quiet", "Set");
         setButton.type = "button";
         setButton.dataset.setRule = String(rule.rule_id);
-        valueCell.append(valueInput, setButton);
+        valueCell.append(valueInput, setButton, element("small", "field-help", runtimeLabel));
       } else if (rule.kind === "BIT_RANGE") {
         const value = element("span", "signal-name");
+        const valueKind = rule.dynamic && !manualDynamic
+          ? `App source: ${rule.value_source || "registered runtime value"}`
+          : rule.dynamic ? "Manual live-adjustable raw value" : "Fixed raw value";
         value.append(
           element("code", "", exactRuleValue(rule)),
-          element("small", "", "Restage to change")
+          element("small", "", valueKind)
+        );
+        valueCell.append(value);
+      } else if (counterControl || sequenceControl) {
+        const value = element("span", "signal-name");
+        value.append(
+          element("code", "", exactRuntimeValue(rule)),
+          element("small", "", counterControl ? "Current counter state" : "Current sequence index")
+        );
+        valueCell.append(value);
+      } else if (rule.kind === "RAW_MASK") {
+        const value = element("span", "signal-name raw-rule-value");
+        value.append(
+          element("code", "", rule.mask || "--"),
+          element("small", "", `value ${rule.value || "--"}`)
         );
         valueCell.append(value);
       } else {
-        valueCell.textContent = "mask";
+        const value = element("span", "signal-name");
+        value.append(
+          element("strong", "", String(rule.kind || "advanced").replaceAll("_", " ")),
+          element("small", "", "Full parameters live in package source")
+        );
+        valueCell.append(value);
       }
 
       const stateCell = element("td", "rule-state-control");
-      stateCell.append(element("span", "badge warning", "Candidate"));
-      const toggle = element("label", "rule-switch");
-      const checkbox = element("input");
-      checkbox.type = "checkbox";
-      // `active` is retained by the API as a compatibility alias for a rule's
-      // enabled flag. It does not identify which table this row came from.
-      checkbox.checked = typeof rule.enabled === "boolean" ? rule.enabled : Boolean(rule.active);
-      checkbox.dataset.toggleRule = String(rule.rule_id);
-      checkbox.setAttribute("aria-label", `Enable rule ${rule.rule_id}`);
-      toggle.append(checkbox, element("span", "", "Enabled"));
-      stateCell.append(toggle);
+      const enabled = typeof rule.enabled === "boolean" ? rule.enabled : Boolean(rule.active);
+      const candidateLabel = state.candidateDirty ? "Pending" : "Candidate";
+      stateCell.append(element("span", `badge ${viewingDraft && state.candidateDirty ? "warning" : !viewingDraft && enabled ? "success" : "neutral"}`, viewingDraft ? candidateLabel : enabled ? "Live" : "Disabled"));
+      if (viewingDraft) {
+        const toggle = element("label", "rule-switch");
+        const checkbox = element("input");
+        checkbox.type = "checkbox";
+        // `active` is retained by the API as a compatibility alias for a
+        // rule's enabled flag. It does not identify the table view.
+        checkbox.checked = enabled;
+        checkbox.dataset.toggleRule = String(rule.rule_id);
+        checkbox.setAttribute("aria-label", `Enable rule ${rule.rule_id}`);
+        toggle.append(checkbox, element("span", "", "Include on Apply"));
+        stateCell.append(toggle, element("small", "field-help", "RAM draft only"));
+      }
       row.append(idCell, target, valueCell, stateCell);
       dom.ruleRows.append(row);
     });
   }
 
-  async function refreshRules() {
-    // The editor works on the candidate table. Plain GET /api/rules is the
-    // active table currently affecting traffic and is intentionally separate.
-    const payload = await api("/api/rules?view=staging", { quiet: true });
-    state.rules = payload.rules || [];
-    state.ruleEpoch = Number(payload.rule_epoch || 0);
+  function setRuleView(view) {
+    if (view !== "staging" && view !== "active") return;
+    state.ruleView = view;
+    const viewingDraft = view === "staging";
+    document.querySelectorAll("[data-rule-view]").forEach((button) => {
+      const selected = button.dataset.ruleView === view;
+      button.classList.toggle("active", selected);
+      button.setAttribute("aria-selected", selected ? "true" : "false");
+    });
+    const hasPendingChanges = viewingDraft && state.candidateDirty;
+    setBadge(
+      dom.ruleViewBadge,
+      viewingDraft ? (hasPendingChanges ? "Draft changes" : "Candidate copy") : "Live now",
+      hasPendingChanges ? "warning" : viewingDraft ? "neutral" : "success"
+    );
+    dom.ruleTableHelp.textContent = viewingDraft
+      ? hasPendingChanges
+        ? "These candidate changes do not affect forwarded frames until Apply. Include toggles affect this RAM draft only."
+        : "This candidate copy matches the live table. Stage or edit a rule to begin a new RAM draft."
+      : "This read-only view is the rule table affecting forwarded frames now.";
+    dom.commitRulesButton.hidden = !hasPendingChanges;
+    dom.revertRulesButton.hidden = !hasPendingChanges;
+    dom.clearDraftButton.hidden = !viewingDraft;
     renderRules();
   }
 
+  async function refreshRules() {
+    const [candidate, active] = await Promise.all([
+      api("/api/rules?view=staging", { quiet: true }),
+      api("/api/rules", { quiet: true })
+    ]);
+    state.candidateRules = candidate.rules || [];
+    state.activeRules = active.rules || [];
+    state.candidateDirty = Boolean(candidate.candidate_dirty);
+    state.ruleEpoch = Number(candidate.rule_epoch || active.rule_epoch || 0);
+    if (!state.rulesInitialized) {
+      state.ruleView = state.candidateDirty || !state.activeRules.length ? "staging" : "active";
+      state.rulesInitialized = true;
+    }
+    setRuleView(state.ruleView);
+  }
+
   async function setRuleValue(ruleId, value) {
+    const rule = state.candidateRules.find((entry) => Number(entry.rule_id) === Number(ruleId));
+    const runtimeKind = String(rule?.runtime_value_kind || "");
+    const manualDynamic = runtimeKind === "raw" || Boolean(rule && rule.kind === "BIT_RANGE" && rule.dynamic &&
+      rule.manual_dynamic !== false && !String(rule.value_source || "").trim());
+    const counter = runtimeKind === "counter_state" || rule?.kind === "COUNTER";
+    const sequence = runtimeKind === "sequence_index" || rule?.kind === "SEQUENCE8";
+    if (!rule || (!manualDynamic && !counter && !sequence)) {
+      throw new Error("Choose a candidate rule with a runtime value control");
+    }
+    const textValue = String(value).trim();
+    const valueLabel = counter ? "Counter state" : sequence ? "Sequence index" : "Raw value";
+    if (!/^\d+$/.test(textValue)) throw new Error(`${valueLabel} must be a non-negative whole number`);
+    const raw = BigInt(textValue);
+    if (sequence) {
+      const count = Number(rule.sequence_count || 0);
+      if (!Number.isInteger(count) || count < 1 || raw >= BigInt(count)) {
+        throw new Error(`Sequence index must be between 0 and ${Math.max(0, count - 1)}`);
+      }
+    } else {
+      const width = Math.min(32, Number(rule.length || 0));
+      if (width < 1 || raw >= (1n << BigInt(width))) {
+        throw new Error(`${valueLabel} must fit in ${width} bits`);
+      }
+    }
     await postForm("/api/rules/value", {
       rule_id: ruleId,
       rule_epoch: state.ruleEpoch,
-      value
+      view: "staging",
+      value: raw.toString()
     });
     await refreshRules();
-    showToast("Rule value updated", `Rule #${ruleId} now uses raw ${value}.`, "success");
+    showToast(`${valueLabel} updated`, `Rule #${ruleId} will start at ${raw.toString()} after you apply the draft.`, "success");
   }
 
   async function setRuleEnabled(ruleId, enabled) {
     await postForm("/api/rules/enable", {
       rule_id: ruleId,
       rule_epoch: state.ruleEpoch,
+      view: "staging",
       enabled: enabled ? 1 : 0
     });
     await refreshRules();
-    showToast(enabled ? "Rule enabled" : "Rule disabled", `Rule #${ruleId} was updated.`, "success");
+    showToast(
+      enabled ? "Rule enabled in draft" : "Rule disabled in draft",
+      `Rule #${ruleId} will change after you apply the draft.`,
+      "success"
+    );
   }
 
   async function ruleAction(action, successMessage) {
@@ -630,11 +1369,11 @@
   }
 
   function packageFromVisibleRules() {
-    const unsupported = state.rules.some((rule) => rule.kind !== "BIT_RANGE" || rule.dynamic);
+    const unsupported = state.candidateRules.some((rule) => rule.kind !== "BIT_RANGE" || rule.dynamic);
     if (unsupported) {
-      throw new Error("This table contains dynamic or raw-mask rules. Keep their original .ssrules text so source details are not lost.");
+      throw new Error("This draft contains RAM-only or advanced rules that cannot be reconstructed from the list response. Keep or generate their original .ssrules text.");
     }
-    const rows = state.rules.map((rule) =>
+    const rows = state.candidateRules.map((rule) =>
       `STATIC,${formatCanId(rule.can_id)},${rule.direction},${rule.start_bit},${rule.length},${rule.little_endian === false ? 0 : 1},${exactRuleValue(rule)}`
     );
     if (!rows.length) throw new Error("Create or paste at least one rule first");
@@ -651,10 +1390,27 @@
 
   async function savePackage() {
     const text = currentPackageText();
-    const result = await postText(`/api/rules/package?path=${encodeURIComponent(ACTIVE_PACKAGE_PATH)}`, text);
-    state.ruleEpoch = Number(result.rule_epoch || state.ruleEpoch);
-    await Promise.all([refreshRules(), pollStatus()]);
-    showToast("Startup package saved", `${result.count ?? state.rules.length} rules will return after reboot.`, "success");
+    try {
+      const result = await postText(`/api/rules/package?path=${encodeURIComponent(ACTIVE_PACKAGE_PATH)}`, text);
+      state.ruleEpoch = Number(result.rule_epoch || state.ruleEpoch);
+      await Promise.all([refreshRules(), pollStatus()]);
+      setRuleView("active");
+      if (result.runtime_bindings_verified === false) {
+        showToast(
+          "Package parsed in preview",
+          `${result.count ?? state.activeRules.length} rows are simulated. App-owned sources and tables can only be verified by firmware with that native extension installed.`,
+          "warning"
+        );
+      } else {
+        showToast("Startup package installed", `${result.count ?? state.activeRules.length} validated rules are live now and will return after reboot.`, "success");
+      }
+    } catch (error) {
+      // The transactional loader preserves the live table but discards its
+      // partially parsed candidate on rejection. Refresh so a stale-looking
+      // draft can never be applied later as an unintended empty table.
+      await Promise.allSettled([refreshRules(), pollStatus()]);
+      throw error;
+    }
   }
 
   async function loadExistingPackage() {
@@ -690,18 +1446,19 @@
     const payload = await postText("/api/dbc", state.dbcText, { timeout: 15000 });
     state.catalogSignals = [];
     state.catalogOffset = 0;
-    dom.packageText.value = "";
+    resetRuleBuilder();
     await Promise.all([pollStatus(), refreshRules(), refreshCatalog(true)]);
     setBadge(dom.dbcStatus, `${payload.signals || 0} signals`, "success");
-    showToast("DBC loaded", `${payload.messages || 0} messages and ${payload.signals || 0} signals are ready.`, "success");
+    showToast("DBC loaded", `${payload.messages || 0} messages and ${payload.signals || 0} signals are ready. Rule source remains in the editor, but no rules are live.`, "success");
   }
 
   async function autoloadDbc() {
     const payload = await postForm("/api/dbc/autoload", {});
     state.catalogSignals = [];
     state.catalogOffset = 0;
+    resetRuleBuilder();
     await Promise.all([pollStatus(), refreshRules(), refreshCatalog(true)]);
-    showToast("Installed DBC reloaded", `${payload.signals || 0} signals are ready.`, "success");
+    showToast("Installed DBC reloaded", `${payload.signals || 0} signals are ready. Rule source remains in the editor, but no rules are live.`, "success");
   }
 
   async function acceptDbcFile(file) {
@@ -872,12 +1629,44 @@
     });
 
     dom.frameRefresh.addEventListener("click", () => void runAction(dom.frameRefresh, pollFrames).catch(() => {}));
+    document.querySelectorAll("[data-builder-mode]").forEach((button) => {
+      button.addEventListener("click", () => setBuilderMode(button.dataset.builderMode));
+    });
+    dom.ruleBehavior.addEventListener("change", updateRuleBehavior);
     dom.rulePhysicalValue.addEventListener("input", syncRawFromPhysical);
-    dom.ruleLength.addEventListener("input", syncRawFromPhysical);
-    dom.ruleLittleEndian.addEventListener("change", syncRawFromPhysical);
+    [dom.ruleCanId, dom.ruleStartBit, dom.ruleLength].forEach((input) => {
+      input.addEventListener("input", () => {
+        clearSignalConversionIfTargetChanged();
+        syncRawFromPhysical();
+      });
+    });
+    [dom.ruleDirection, dom.ruleLittleEndian].forEach((input) => {
+      input.addEventListener("change", () => {
+        clearSignalConversionIfTargetChanged();
+        syncRawFromPhysical();
+      });
+    });
     dom.ruleRawValue.addEventListener("input", syncPhysicalFromRaw);
     dom.stageRuleButton.addEventListener("click", () => void runAction(dom.stageRuleButton, stageRule).catch(() => {}));
     dom.resetRuleButton.addEventListener("click", resetRuleBuilder);
+
+    dom.rawBitGrid.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-raw-bit]");
+      if (button) cycleRawBit(Number(button.dataset.rawBit));
+    });
+    dom.loadRawFrameButton.addEventListener("click", () => void runAction(dom.loadRawFrameButton, async () => useLatestRawFrame()).catch(() => {}));
+    dom.stageRawMaskButton.addEventListener("click", () => void runAction(dom.stageRawMaskButton, stageRawMask).catch(() => {}));
+    dom.clearRawMaskButton.addEventListener("click", resetRawMask);
+
+    dom.recipeType.addEventListener("change", renderRecipeFields);
+    dom.recipeFields.addEventListener("input", updateRecipePreview);
+    dom.recipeFields.addEventListener("change", updateRecipePreview);
+    dom.addRecipeButton.addEventListener("click", () => void runAction(dom.addRecipeButton, async () => addRecipeToPackage()).catch(() => {}));
+    dom.resetRecipeButton.addEventListener("click", renderRecipeFields);
+
+    document.querySelectorAll("[data-rule-view]").forEach((button) => {
+      button.addEventListener("click", () => setRuleView(button.dataset.ruleView));
+    });
 
     dom.ruleRows.addEventListener("click", (event) => {
       const button = event.target.closest("[data-set-rule]");
@@ -895,18 +1684,24 @@
 
     dom.commitRulesButton.addEventListener("click", () => void runAction(
       dom.commitRulesButton,
-      () => ruleAction("apply_commit", "Rules applied")
+      async () => {
+        await ruleAction("apply_commit", "Draft applied to live traffic");
+        setRuleView("active");
+      }
     ).catch(() => {}));
     dom.revertRulesButton.addEventListener("click", () => void runAction(
       dom.revertRulesButton,
-      () => ruleAction("revert", "Candidate reverted")
+      () => ruleAction("revert", "Draft reset to the live table")
     ).catch(() => {}));
-    dom.clearRulesButton.addEventListener("click", () => void runAction(dom.clearRulesButton, async () => {
-      await ruleAction("clear_rules", "Rules cleared");
-      dom.packageText.value = "";
-    }).catch(() => {}));
+    dom.clearDraftButton.addEventListener("click", () => void runAction(
+      dom.clearDraftButton,
+      () => ruleAction("clear_staging", "Draft emptied")
+    ).catch(() => {}));
+    dom.clearRulesButton.addEventListener("click", () => void runAction(
+      dom.clearRulesButton,
+      () => ruleAction("clear_rules", "Live and draft rules stopped")
+    ).catch(() => {}));
     dom.savePackageButton.addEventListener("click", () => void runAction(dom.savePackageButton, savePackage).catch(() => {}));
-    dom.loadPackageTextButton.addEventListener("click", () => void runAction(dom.loadPackageTextButton, savePackage).catch(() => {}));
     dom.downloadPackageButton.addEventListener("click", downloadPackage);
 
     dom.startLogButton.addEventListener("click", () => void runAction(dom.startLogButton, () => logAction("start")).catch(() => {}));
@@ -930,6 +1725,10 @@
     initializeTheme();
     bindEvents();
     resetRuleBuilder();
+    resetRawMask();
+    renderRecipeFields();
+    setBuilderMode("signal");
+    setRuleView("staging");
     dom.stopLogButton.disabled = true;
 
     await Promise.allSettled([

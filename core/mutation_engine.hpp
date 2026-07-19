@@ -101,6 +101,7 @@ public:
 
     size_t stagingCount() const;
     size_t activeCount() const;
+    bool stagingDirty() const;
     uint32_t ruleEpoch() const;
 
     bool hasRulesForFrame(uint32_t can_id, Direction direction) const;
@@ -120,6 +121,14 @@ public:
     // after a package/DBC generation swap.
     bool setRuleValue(uint16_t rule_id, uint32_t value, uint32_t expected_epoch);
     bool enableRule(uint16_t rule_id, bool enabled, uint32_t expected_epoch);
+    // Explicit live controls. Unlike the backward-compatible methods above,
+    // these never redirect into a pending candidate with the same slot ID.
+    bool setActiveRuleValue(uint16_t rule_id, uint32_t value, uint32_t expected_epoch);
+    bool setActiveRuleEnabled(uint16_t rule_id, bool enabled, uint32_t expected_epoch);
+    // Candidate-only controls used by authoring UIs. These update the table
+    // that the next applyCommit() will publish without touching live traffic.
+    bool setStagedRuleValue(uint16_t rule_id, uint32_t value, uint32_t expected_epoch);
+    bool setStagedRuleEnabled(uint16_t rule_id, bool enabled, uint32_t expected_epoch);
 
     void clearRules();
     size_t listRules(RuleListEntry* out_entries, size_t capacity) const;
@@ -209,6 +218,7 @@ private:
 
     bool compileRule(const StagedRule& staged_rule, uint16_t priority, CompiledRule& out_rule);
     static void applyStaticRule(const CompiledRule& rule, CanFrame& frame);
+    static void writeDynamicValue(const CompiledRule& rule, CanFrame& frame, uint32_t value);
     void applyDynamicRule(const CompiledRule& rule, CanFrame& frame) const;
     void applyCounterRule(const CompiledRule& rule, CanFrame& frame) const;
     void applySequenceRule(const CompiledRule& rule, CanFrame& frame) const;
@@ -230,6 +240,7 @@ private:
     // candidate table. Rule contents remain application-lock protected; the
     // lightweight count is atomic so status reads are race-free.
     std::atomic<uint16_t> staged_count_{0U};
+    std::atomic<uint8_t> staging_dirty_{0U};
 
     StagedRule* committed_shadow_ = nullptr;
     uint16_t committed_count_ = 0;

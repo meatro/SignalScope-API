@@ -306,8 +306,8 @@ bool tryParseUIntArg(const char* name, uint32_t& output) {
     const String text = server.arg(name);
     if (text.length() == 0U || text[0] == '-') return false;
     char* end_ptr = nullptr;
-    const unsigned long value = std::strtoul(text.c_str(), &end_ptr, 0);
-    if (end_ptr == text.c_str() || *end_ptr != '\0') return false;
+    const unsigned long long value = std::strtoull(text.c_str(), &end_ptr, 0);
+    if (end_ptr == text.c_str() || *end_ptr != '\0' || value > 0xFFFFFFFFULL) return false;
     output = static_cast<uint32_t>(value);
     return true;
 }
@@ -2540,6 +2540,14 @@ void handleRuleStage() {
         ? server.arg("rule_kind")
         : (server.hasArg("kind") ? server.arg("kind") : "BIT_RANGE");
 
+    if (kind_text != "BIT_RANGE" && kind_text != "RAW_MASK") {
+        // Advanced COUNTER/SEQUENCE/checksum/source rules have additional
+        // fields and are compiled through the transactional .ssrules loader.
+        // Silently treating a misspelled or package-only kind as BIT_RANGE
+        // would stage a valid-looking but entirely different mutation.
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"unsupported_staged_rule_kind\"}");
+        return;
+    }
     request.kind = (kind_text == "RAW_MASK") ? RuleKind::RAW_MASK : RuleKind::BIT_RANGE;
     if (!tryParseUIntArg("can_id", request.can_id) || request.can_id > 0x1FFFFFFFU) {
         server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_can_id\"}");
@@ -2658,6 +2666,12 @@ void handleRulePackageWrite() {
         return;
     }
     const String previous_active_path = active_rule_package_path;
+    // Keep a bounded RAM snapshot in case the validated rules compile but the
+    // subsequent LittleFS promote fails. This also covers a live table that
+    // was authored only in RAM and therefore has no package file to reload.
+    const size_t previous_rule_count = ui_rule_scratch == nullptr
+        ? 0U
+        : mutation_engine.listRules(ui_rule_scratch, MutationEngine::kMaxRules);
     if (!loadRulePackageFromFilePath(kUploadPath)) {
         LittleFS.remove(kUploadPath);
         server.send(422, "application/json", "{\"ok\":false,\"error\":\"rule_package_invalid\"}");
@@ -2668,11 +2682,27 @@ void handleRulePackageWrite() {
     // previous startup package intact.
     if (!LittleFS.rename(kUploadPath, path)) {
         LittleFS.remove(kUploadPath);
-        active_rule_package_path = "";
-        const String restore_path = LittleFS.exists(path) ? path : previous_active_path;
-        if (validRulePackagePath(restore_path) && LittleFS.exists(restore_path)) {
-            static_cast<void>(loadRulePackageFromFilePath(restore_path));
+        bool restored = false;
+        if (previous_active_path.length() > 0U && validRulePackagePath(previous_active_path) &&
+            LittleFS.exists(previous_active_path)) {
+            restored = loadRulePackageFromFilePath(previous_active_path);
         }
+        if (!restored && ui_rule_scratch != nullptr) {
+            mutation_engine.clearStaging();
+            restored = true;
+            for (size_t i = 0U; i < previous_rule_count; ++i) {
+                RuleStageRequest request = ui_rule_scratch[i].request;
+                request.enabled = ui_rule_scratch[i].active;
+                if (!mutation_engine.stageRule(request, nullptr)) {
+                    restored = false;
+                    break;
+                }
+            }
+            if (restored) restored = mutation_engine.applyCommit();
+        }
+        if (!restored) mutation_engine.clearRules();
+        active_rule_package_path = previous_active_path;
+        invalidateApplicationResourcesLocked();
         server.send(507, "application/json", "{\"ok\":false,\"error\":\"rule_package_promote_failed\"}");
         return;
     }
@@ -2779,7 +2809,8 @@ void handleRulesList() {
         return;
     }
     RuleListEntry* rules = ui_rule_scratch;
-    const String requested_view = server.hasArg("view") ? server.arg("view") : "active";
+    const bool view_supplied = server.hasArg("view");
+    const String requested_view = view_supplied ? server.arg("view") : "active";
     if (requested_view != "active" && requested_view != "staging") {
         server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_rules_view\"}");
         return;
@@ -2807,6 +2838,7 @@ void handleRulesList() {
     json.reserve(22000);
     json += "{\"ok\":true,\"view\":\"" + requested_view +
         "\",\"count\":" + String(static_cast<uint32_t>(count)) +
+        ",\"candidate_dirty\":" + String(mutation_engine.stagingDirty() ? "true" : "false") +
         ",\"rule_epoch\":" + String(snapshot_epoch) + ",\"rules\":[";
     for (size_t i = 0; i < count; ++i) {
         if (i > 0U) json += ",";
@@ -2824,9 +2856,29 @@ void handleRulesList() {
         json += "\"length\":" + String(item.request.bit_length) + ",";
         json += "\"little_endian\":" + String(item.request.little_endian ? "true" : "false") + ",";
         json += "\"dynamic\":" + String(item.request.dynamic_value ? "true" : "false") + ",";
+        json += "\"manual_dynamic\":" + String(
+            item.request.dynamic_value && item.request.value_source[0] == '\0' ? "true" : "false") + ",";
+        json += "\"value_source\":\"" + escapeJsonString(item.request.value_source) + "\",";
         const String replace_value_text = uint64ToDecimalString(item.request.replace_value);
         json += "\"replace_value\":" + replace_value_text + ",";
-        json += "\"replace_value_text\":\"" + replace_value_text + "\"";
+        json += "\"replace_value_text\":\"" + replace_value_text + "\",";
+        uint32_t runtime_value = 0U;
+        const char* runtime_value_kind = "none";
+        if (item.request.kind == RuleKind::BIT_RANGE && item.request.dynamic_value &&
+            item.request.value_source[0] == '\0') {
+            runtime_value = static_cast<uint32_t>(item.request.replace_value);
+            runtime_value_kind = "raw";
+        } else if (item.request.kind == RuleKind::COUNTER) {
+            runtime_value = item.request.counter_initial;
+            runtime_value_kind = "counter_state";
+        } else if (item.request.kind == RuleKind::SEQUENCE8) {
+            runtime_value = item.request.sequence_initial_index;
+            runtime_value_kind = "sequence_index";
+        }
+        json += "\"runtime_value\":" + String(runtime_value) + ",";
+        json += "\"runtime_value_text\":\"" + String(runtime_value) + "\",";
+        json += "\"runtime_value_kind\":\"" + String(runtime_value_kind) + "\",";
+        json += "\"sequence_count\":" + String(item.request.sequence_count);
         if (item.request.kind == RuleKind::RAW_MASK) {
             json += ",\"mask\":\"";
             for (uint8_t b = 0U; b < 8U; ++b) {
@@ -2860,20 +2912,41 @@ void handleRuleValue() {
         return;
     }
 
-    const uint32_t value = parseUIntArg("value", 0U);
+    uint32_t value = 0U;
+    if (!tryParseUIntArg("value", value)) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_rule_value\"}");
+        return;
+    }
     const uint32_t expected_epoch = parseUIntArg("rule_epoch", parseUIntArg("epoch", 0U));
     if (expected_epoch != mutation_engine.ruleEpoch()) {
         server.send(409, "application/json", "{\"ok\":false,\"error\":\"stale_rule_handle\"}");
         return;
     }
-    if (!mutation_engine.setRuleValue(static_cast<uint16_t>(rule_id), value, expected_epoch)) {
-        server.send(404, "application/json", "{\"ok\":false,\"error\":\"rule_not_found\"}");
+    const bool view_supplied = server.hasArg("view");
+    const String requested_view = view_supplied ? server.arg("view") : "active";
+    if (requested_view != "active" && requested_view != "staging") {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_rules_view\"}");
+        return;
+    }
+    const bool staged_only = requested_view == "staging";
+    const bool value_ok = staged_only
+        ? mutation_engine.setStagedRuleValue(static_cast<uint16_t>(rule_id), value, expected_epoch)
+        : view_supplied
+            ? mutation_engine.setActiveRuleValue(static_cast<uint16_t>(rule_id), value, expected_epoch)
+            : mutation_engine.setRuleValue(static_cast<uint16_t>(rule_id), value, expected_epoch);
+    if (!value_ok) {
+        server.send(422, "application/json", "{\"ok\":false,\"error\":\"rule_value_rejected\"}");
         return;
     }
 
     if (server.hasArg("enabled")) {
-        if (!mutation_engine.enableRule(
-                static_cast<uint16_t>(rule_id), parseBoolText(server.arg("enabled"), true), expected_epoch)) {
+        const bool enabled = parseBoolText(server.arg("enabled"), true);
+        const bool enable_ok = staged_only
+            ? mutation_engine.setStagedRuleEnabled(static_cast<uint16_t>(rule_id), enabled, expected_epoch)
+            : view_supplied
+                ? mutation_engine.setActiveRuleEnabled(static_cast<uint16_t>(rule_id), enabled, expected_epoch)
+                : mutation_engine.enableRule(static_cast<uint16_t>(rule_id), enabled, expected_epoch);
+        if (!enable_ok) {
             const bool stale = expected_epoch != mutation_engine.ruleEpoch();
             server.send(stale ? 409 : 404, "application/json",
                 stale ? "{\"ok\":false,\"error\":\"stale_rule_handle\"}"
@@ -2921,8 +2994,19 @@ void handleRuleEnable() {
             return;
         }
     }
-    const bool ok = mutation_engine.enableRule(
-        static_cast<uint16_t>(rule_id), parseBoolText(server.arg("enabled"), true), expected_epoch);
+    const bool view_supplied = server.hasArg("view");
+    const String requested_view = view_supplied ? server.arg("view") : "active";
+    if (requested_view != "active" && requested_view != "staging") {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_rules_view\"}");
+        return;
+    }
+    const bool staged_only = requested_view == "staging";
+    const bool enabled = parseBoolText(server.arg("enabled"), true);
+    const bool ok = staged_only
+        ? mutation_engine.setStagedRuleEnabled(static_cast<uint16_t>(rule_id), enabled, expected_epoch)
+        : view_supplied
+            ? mutation_engine.setActiveRuleEnabled(static_cast<uint16_t>(rule_id), enabled, expected_epoch)
+            : mutation_engine.enableRule(static_cast<uint16_t>(rule_id), enabled, expected_epoch);
     server.send(ok ? 200 : 404, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"rule_not_found\"}");
 }
 
@@ -3403,13 +3487,33 @@ void appendActiveRulesJson(String& json) {
         json += "\"direction\":\"" + String(directionToString(item.request.direction)) + "\",";
         json += "\"enabled\":" + String(item.active ? "true" : "false") + ",";
         json += "\"dynamic\":" + String(item.request.dynamic_value ? "true" : "false") + ",";
+        json += "\"manual_dynamic\":" + String(
+            item.request.dynamic_value && item.request.value_source[0] == '\0' ? "true" : "false") + ",";
+        json += "\"value_source\":\"" + escapeJsonString(item.request.value_source) + "\",";
         json += "\"start_bit\":" + String(item.request.start_bit) + ",";
         json += "\"length\":" + String(item.request.bit_length) + ",";
         json += "\"little_endian\":" + String(item.request.little_endian ? "true" : "false") + ",";
         json += "\"operation\":\"" + String(item.request.kind == RuleKind::RAW_MASK ? "RAW_MASK" : "REPLACE") + "\",";
         const String replace_value_text = uint64ToDecimalString(item.request.replace_value);
         json += "\"replace_value\":" + replace_value_text + ",";
-        json += "\"replace_value_text\":\"" + replace_value_text + "\"";
+        json += "\"replace_value_text\":\"" + replace_value_text + "\",";
+        uint32_t runtime_value = 0U;
+        const char* runtime_value_kind = "none";
+        if (item.request.kind == RuleKind::BIT_RANGE && item.request.dynamic_value &&
+            item.request.value_source[0] == '\0') {
+            runtime_value = static_cast<uint32_t>(item.request.replace_value);
+            runtime_value_kind = "raw";
+        } else if (item.request.kind == RuleKind::COUNTER) {
+            runtime_value = item.request.counter_initial;
+            runtime_value_kind = "counter_state";
+        } else if (item.request.kind == RuleKind::SEQUENCE8) {
+            runtime_value = item.request.sequence_initial_index;
+            runtime_value_kind = "sequence_index";
+        }
+        json += "\"runtime_value\":" + String(runtime_value) + ",";
+        json += "\"runtime_value_text\":\"" + String(runtime_value) + "\",";
+        json += "\"runtime_value_kind\":\"" + String(runtime_value_kind) + "\",";
+        json += "\"sequence_count\":" + String(item.request.sequence_count);
 
         if (item.request.kind == RuleKind::RAW_MASK) {
             json += ",\"mask\":\"";
@@ -3542,6 +3646,7 @@ void handleStatus() {
         String(gateway.mutationDirectionAllowed(Direction::B_TO_A) ? "true" : "false") + ",";
     json += "\"active_mutations\":" + String(static_cast<uint32_t>(mutation_engine.activeCount())) + ",";
     json += "\"staging_mutations\":" + String(static_cast<uint32_t>(mutation_engine.stagingCount())) + ",";
+    json += "\"candidate_dirty\":" + String(mutation_engine.stagingDirty() ? "true" : "false") + ",";
     json += "\"rule_epoch\":" + String(mutation_engine.ruleEpoch()) + ",";
     json += "\"dbc_loaded\":" + String(dbc != nullptr ? "true" : "false") + ",";
     json += "\"dbc_path\":\"" + escapeJsonString(active_dbc_path.c_str()) + "\",";

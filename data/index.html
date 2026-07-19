@@ -76,7 +76,7 @@
       </article>
 
       <article class="card">
-        <div class="card-heading"><div><span class="step">2</span><h2>Find a signal</h2></div><span id="signalTotal" class="badge neutral">0 signals</span></div>
+        <div class="card-heading"><div><span class="step">2</span><h2>Observe a signal</h2></div><span id="signalTotal" class="badge neutral">0 signals</span></div>
         <p>Search for the value your app needs. Try the full word and abbreviations, then verify that its live behavior makes physical sense.</p>
         <div class="search-row">
           <label class="field grow"><span>Search the DBC</span><input id="signalSearch" type="search" placeholder="oil, temperature, rpm…" autocomplete="off"></label>
@@ -104,50 +104,158 @@
     </section>
 
     <section id="rules" class="section">
-      <div class="section-heading"><div><p class="eyebrow">From discovery to behavior</p><h2>Create a rule</h2></div><span id="ruleStateBadge" class="badge neutral">Empty candidate</span></div>
+      <div class="section-heading">
+        <div><p class="eyebrow">From discovery to behavior</p><h2>Rule workstation</h2></div>
+        <span id="ruleStateBadge" class="badge neutral">Empty draft</span>
+      </div>
+      <p class="section-intro">Start with one decoded signal, work directly with frame bits, or generate an advanced rule package. Every path uses the same SignalScope mutation engine.</p>
+
+      <div class="rule-lifecycle" aria-label="Rule lifecycle">
+        <span><strong>1</strong> Author</span><i aria-hidden="true">→</i>
+        <span><strong>2</strong> Add to draft</span><i aria-hidden="true">→</i>
+        <span><strong>3</strong> Apply live</span><i aria-hidden="true">→</i>
+        <span><strong>4</strong> Install for boot</span>
+      </div>
+
+      <div class="mode-tabs" role="tablist" aria-label="Rule builder mode">
+        <button class="mode-tab active" type="button" role="tab" aria-selected="true" data-builder-mode="signal">Set a signal</button>
+        <button class="mode-tab" type="button" role="tab" aria-selected="false" data-builder-mode="raw">Raw bits</button>
+        <button class="mode-tab" type="button" role="tab" aria-selected="false" data-builder-mode="package">Advanced package</button>
+      </div>
+
       <div class="two-column rule-layout">
-        <article class="card">
-          <h3>Beginner rule builder</h3>
-          <p id="selectedSignalHelp">Choose <strong>Use in rule</strong> beside a DBC signal, or enter the bit location manually.</p>
-          <div id="selectedSignal" class="selected-signal" hidden></div>
-          <div class="form-grid">
-            <label class="field"><span>CAN ID</span><input id="ruleCanId" value="0x321" inputmode="text"></label>
-            <label class="field"><span>Direction</span><select id="ruleDirection"><option>A_TO_B</option><option>B_TO_A</option></select></label>
-            <label class="field"><span>Start bit</span><input id="ruleStartBit" type="number" min="0" max="63" value="0"></label>
-            <label class="field"><span>Length</span><input id="ruleLength" type="number" min="1" max="64" value="8"></label>
-            <label class="field"><span>Desired physical value</span><input id="rulePhysicalValue" type="number" step="any" value="90"></label>
-            <label class="field"><span>Encoded raw value</span><input id="ruleRawValue" type="number" min="0" value="130"></label>
+        <article class="card rule-builder-card">
+          <div class="builder-panel" data-builder-panel="signal">
+            <div class="card-heading compact-heading">
+              <div><span class="step">A</span><h3>Set a decoded field</h3></div>
+              <span id="signalRulePersistence" class="badge success">Package-ready</span>
+            </div>
+            <p id="selectedSignalHelp">Choose <strong>Build rule</strong> beside a DBC signal, or open the frame target and enter its bit location manually.</p>
+            <div id="selectedSignal" class="selected-signal" hidden></div>
+
+            <div class="form-grid">
+              <label class="field"><span>Rule behavior</span><select id="ruleBehavior"><option value="static">Fixed output value</option><option value="dynamic">Live-adjustable raw value</option></select></label>
+              <label class="field"><span>Output value</span><input id="rulePhysicalValue" type="number" step="any" value="90"></label>
+              <label class="field"><span>CAN raw value</span><input id="ruleRawValue" type="text" inputmode="numeric" value="130"></label>
+            </div>
+            <p id="ruleBehaviorHelp" class="field-help">A fixed rule can be written to a startup package after you prove it.</p>
+            <p id="encodingHelp" class="microcopy">No DBC signal selected; enter the raw integer carried by the CAN field.</p>
+
+            <details class="technical-details">
+              <summary>Frame target and encoding</summary>
+              <div class="form-grid">
+                <label class="field"><span>CAN ID</span><input id="ruleCanId" value="0x321" inputmode="text"></label>
+                <label class="field"><span>Frame path</span><select id="ruleDirection"><option value="A_TO_B">Bus A → Bus B</option><option value="B_TO_A">Bus B → Bus A</option></select></label>
+                <label class="field"><span>Start bit</span><input id="ruleStartBit" type="number" min="0" max="63" value="0"></label>
+                <label class="field"><span>Length</span><input id="ruleLength" type="number" min="1" max="64" value="8"></label>
+              </div>
+              <label class="check"><input id="ruleLittleEndian" type="checkbox" checked><span>Intel / little-endian bit order</span></label>
+            </details>
+
+            <div class="actions">
+              <button id="stageRuleButton" class="button primary" type="button">Add to draft</button>
+              <button id="resetRuleButton" class="button secondary" type="button">Reset builder</button>
+            </div>
+            <p class="callout"><strong>The draft is not live.</strong> Adding a rule prepares a candidate table. Forwarded CAN frames change only after you apply that complete draft.</p>
           </div>
-          <label class="check"><input id="ruleLittleEndian" type="checkbox" checked><span>Intel / little-endian bit order</span></label>
-          <p id="encodingHelp" class="microcopy">No DBC signal selected; raw value is used directly.</p>
-          <div class="actions">
-            <button id="stageRuleButton" class="button primary" type="button">Stage rule</button>
-            <button id="resetRuleButton" class="button secondary" type="button">Reset</button>
+
+          <div class="builder-panel" data-builder-panel="raw" hidden>
+            <div class="card-heading compact-heading">
+              <div><span class="step">B</span><h3>Force individual frame bits</h3></div>
+              <span class="badge warning">RAM only</span>
+            </div>
+            <p>Pick exactly which bits pass through or become zero or one. This is the visual form of SignalScope's eight-byte <code>RAW_MASK</code> rule.</p>
+            <div class="form-grid">
+              <label class="field"><span>CAN ID</span><input id="rawCanId" value="0x321" inputmode="text"></label>
+              <label class="field"><span>Frame path</span><select id="rawDirection"><option value="A_TO_B">Bus A → Bus B</option><option value="B_TO_A">Bus B → Bus A</option></select></label>
+            </div>
+            <div class="actions split raw-frame-actions">
+              <span id="rawFrameStatus" class="muted">No source frame loaded.</span>
+              <button id="loadRawFrameButton" class="button quiet" type="button">Use latest frame</button>
+            </div>
+            <div class="bit-legend" aria-label="Bit state legend"><span><b>·</b> pass</span><span><b>0</b> force zero</span><span><b>1</b> force one</span></div>
+            <div id="rawBitGrid" class="byte-grid" aria-label="Eight-byte raw bit editor"></div>
+            <div class="form-grid mask-output">
+              <label class="field"><span>Generated mask</span><input id="rawMaskText" value="0000000000000000" readonly></label>
+              <label class="field"><span>Generated value</span><input id="rawValueText" value="0000000000000000" readonly></label>
+            </div>
+            <div class="actions">
+              <button id="stageRawMaskButton" class="button primary" type="button">Add raw mask to draft</button>
+              <button id="clearRawMaskButton" class="button secondary" type="button">Reset bits</button>
+            </div>
+            <p class="callout"><strong>Raw masks are session rules.</strong> They can be drafted and applied live, but the current <code>.ssrules</code> format cannot install them for reboot. Use non-overlapping fixed fields when persistence matters.</p>
           </div>
-          <p class="callout"><strong>Stage is a preview step.</strong> It prepares a new immutable rule table without changing live CAN traffic.</p>
+
+          <div class="builder-panel" data-builder-panel="package" hidden>
+            <div class="card-heading compact-heading">
+              <div><span class="step">C</span><h3>Generate an advanced recipe</h3></div>
+              <span class="badge neutral">Package row</span>
+            </div>
+            <p>Build the exact package rows used by the mutation engine—without memorizing the CSV grammar. Bind rows configure a later mutation; they do not modify a frame by themselves.</p>
+            <label class="field"><span>Recipe type</span>
+              <select id="recipeType">
+                <option value="COUNTER">Rolling counter</option>
+                <option value="SEQUENCE8">Byte sequence</option>
+                <option value="CHECKSUM_XOR">XOR checksum</option>
+                <option value="CHECKSUM_CRC8_AUTOSAR">CRC-8/AUTOSAR data-ID</option>
+                <option value="SOURCE_INT">App-driven value</option>
+                <option value="SOURCE_SELECT_INT">Mode-dependent app value</option>
+                <option value="BIND_TABLE">Bind lookup table</option>
+                <option value="BIND_OVERRIDE">Bind runtime override</option>
+                <option value="BIND_ACTIVE">Bind active modes</option>
+              </select>
+            </label>
+            <p id="recipeDescription" class="field-help"></p>
+            <div id="recipeFields" class="form-grid recipe-fields"></div>
+            <div class="generated-row">
+              <span>Generated <code>.ssrules</code> row</span>
+              <code id="recipePreview">Complete the fields above.</code>
+            </div>
+            <div class="actions">
+              <button id="addRecipeButton" class="button primary" type="button">Add row to package</button>
+              <button id="resetRecipeButton" class="button secondary" type="button">Reset recipe</button>
+            </div>
+            <p id="recipeNotice" class="callout info"><strong>Package recipes are authored first.</strong> Review the generated source, then install the complete package when it is ready.</p>
+          </div>
         </article>
 
-        <article class="card">
-          <h3>Review and apply</h3>
-          <div class="table-shell compact">
-            <table><thead><tr><th>ID</th><th>Target</th><th>Value</th><th>State</th></tr></thead><tbody id="ruleRows"><tr><td colspan="4" class="empty">No rules loaded.</td></tr></tbody></table>
+        <article class="card rule-review-card">
+          <div class="card-heading compact-heading">
+            <div><span class="step">2</span><h3>Review rule tables</h3></div>
+            <span id="ruleViewBadge" class="badge neutral">Candidate copy</span>
           </div>
-          <div class="actions">
-            <button id="commitRulesButton" class="button warning" type="button">Apply now</button>
-            <button id="revertRulesButton" class="button secondary" type="button">Revert candidate</button>
-            <button id="clearRulesButton" class="button danger" type="button">Clear</button>
+          <div class="mode-tabs compact-tabs" role="tablist" aria-label="Rule table view">
+            <button class="mode-tab active" type="button" role="tab" aria-selected="true" data-rule-view="staging">Candidate / draft</button>
+            <button class="mode-tab" type="button" role="tab" aria-selected="false" data-rule-view="active">Live now</button>
           </div>
+          <p id="ruleTableHelp" class="field-help">The candidate copy becomes a draft when you stage or edit a rule. Only Apply changes live traffic.</p>
+          <div class="table-shell compact rule-table-shell">
+            <table><thead><tr><th>ID</th><th>Target</th><th>Value</th><th>State</th></tr></thead><tbody id="ruleRows"><tr><td colspan="4" class="empty">No draft rules.</td></tr></tbody></table>
+          </div>
+          <div class="actions sticky-actions">
+            <button id="commitRulesButton" class="button warning" type="button">Apply draft to live</button>
+            <button id="revertRulesButton" class="button secondary" type="button">Reset draft to live</button>
+            <button id="clearDraftButton" class="button secondary" type="button">Empty draft</button>
+          </div>
+          <details class="danger-zone">
+            <summary>Stop all live rules</summary>
+            <p>This empties the live and draft tables. It does not delete an existing LittleFS startup file, so installed rules may return after reboot.</p>
+            <button id="clearRulesButton" class="button danger" type="button">Stop all live rules</button>
+          </details>
+
           <hr>
-          <h3>Save the proven recipe</h3>
-          <p><strong>Apply now</strong> changes the in-memory pipeline. <strong>Save startup package</strong> validates and stores <code>/rules/active.ssrules</code> so it returns after reboot.</p>
+          <div class="card-heading compact-heading">
+            <div><span class="step">4</span><h3>Startup package</h3></div>
+            <span class="badge neutral">LittleFS</span>
+          </div>
+          <p>Installing validates this package text exactly, activates it as the live table, and stores <code>/rules/active.ssrules</code> in one transaction. RAM-draft Include toggles do not rewrite this source; remove or edit a package row when it should not return after reboot.</p>
           <div class="actions">
-            <button id="savePackageButton" class="button primary" type="button">Save startup package</button>
+            <button id="savePackageButton" class="button primary" type="button">Validate, activate &amp; install</button>
             <button id="downloadPackageButton" class="button secondary" type="button">Download .ssrules</button>
           </div>
-          <details>
-            <summary>View or edit the package</summary>
-            <label class="field"><span>Rule package text</span><textarea id="packageText" rows="9" spellcheck="false" placeholder="# STATIC,can_id,direction,start_bit,length,little_endian,raw_value"></textarea></label>
-            <button id="loadPackageTextButton" class="button secondary" type="button">Load this package now</button>
+          <details id="packageEditor" class="package-editor" open>
+            <summary>Review or edit package source</summary>
+            <label class="field"><span>Rule package text</span><textarea id="packageText" rows="13" spellcheck="false" placeholder="# SignalScope rule package&#10;# Build STATIC, SOURCE_INT, COUNTER, SEQUENCE8 and checksum rows above."></textarea></label>
           </details>
         </article>
       </div>

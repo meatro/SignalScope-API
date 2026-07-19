@@ -80,6 +80,41 @@ uint32_t initialRuntimeValue(const RuleStageRequest& rule) {
     return 0U;
 }
 
+bool runtimeValueFits(const RuleStageRequest& rule, uint32_t value) {
+    if (rule.kind == RuleKind::BIT_RANGE && rule.dynamic_value) {
+        // SOURCE_INT/SOURCE_SELECT_INT are fed by the registered application
+        // value on every matching frame. Pretending a manual write succeeded
+        // would expose a control that has no observable CAN effect.
+        if (rule.value_source[0] != '\0') return false;
+        if (rule.bit_length == 0U || rule.bit_length > 32U) return false;
+        return rule.bit_length == 32U || value <= ((1U << rule.bit_length) - 1U);
+    }
+    if (rule.kind == RuleKind::COUNTER) {
+        if (rule.bit_length == 0U || rule.bit_length > 32U) return false;
+        return rule.bit_length == 32U || value <= ((1U << rule.bit_length) - 1U);
+    }
+    if (rule.kind == RuleKind::SEQUENCE8) {
+        return rule.sequence_count > 0U && value < rule.sequence_count;
+    }
+    return false;
+}
+
+bool encodeRuntimeOutput(double transformed, bool truncate, uint32_t maximum, uint32_t& output) {
+    if (!std::isfinite(transformed)) return false;
+    if (transformed <= 0.0) {
+        output = 0U;
+        return true;
+    }
+    const double integral = truncate ? std::floor(transformed) : std::floor(transformed + 0.5);
+    if (!std::isfinite(integral)) return false;
+    if (integral >= static_cast<double>(maximum)) {
+        output = maximum;
+        return true;
+    }
+    output = static_cast<uint32_t>(integral);
+    return true;
+}
+
 void yieldCommitter() {
 #if defined(ARDUINO_ARCH_ESP32)
     taskYIELD();
@@ -117,6 +152,7 @@ void MutationEngine::init() {
         return;
     }
     staged_count_ = 0U;
+    staging_dirty_.store(0U, std::memory_order_relaxed);
     committed_count_ = 0U;
     next_sequence_ = 1U;
 
@@ -176,6 +212,7 @@ bool MutationEngine::stageRule(const RuleStageRequest& request, uint16_t* out_ru
     staged_[slot].pending_runtime_value = initialRuntimeValue(normalized);
     staged_[slot].pending_enabled = normalized.enabled;
     staged_[slot].publish_runtime_on_commit = true;
+    staging_dirty_.store(1U, std::memory_order_release);
 
     if (out_rule_id != nullptr) {
         *out_rule_id = slot;
@@ -216,12 +253,16 @@ void MutationEngine::clearStaging() {
     advanceRuleEpoch();
     if (staged_ == nullptr) {
         staged_count_ = 0U;
+        staging_dirty_.store(active_count_.load(std::memory_order_acquire) != 0U ? 1U : 0U,
+                             std::memory_order_release);
         return;
     }
     for (size_t i = 0; i < kMaxRules; ++i) {
         staged_[i] = {};
     }
     staged_count_ = 0U;
+    staging_dirty_.store(active_count_.load(std::memory_order_acquire) != 0U ? 1U : 0U,
+                         std::memory_order_release);
 }
 
 void MutationEngine::revertStagingToActive() {
@@ -235,6 +276,7 @@ void MutationEngine::revertStagingToActive() {
         staged_[src.rule_id].in_use = true;
         ++staged_count_;
     }
+    staging_dirty_.store(0U, std::memory_order_release);
 }
 
 bool MutationEngine::applyCommit() {
@@ -364,6 +406,7 @@ bool MutationEngine::applyCommit() {
     }
 
     swapActiveTable();
+    staging_dirty_.store(0U, std::memory_order_release);
     advanceRuleEpoch();
     resumeMutationReads();
     return true;
@@ -375,6 +418,10 @@ size_t MutationEngine::stagingCount() const {
 
 size_t MutationEngine::activeCount() const {
     return active_count_.load(std::memory_order_acquire);
+}
+
+bool MutationEngine::stagingDirty() const {
+    return staging_dirty_.load(std::memory_order_acquire) != 0U;
 }
 
 uint32_t MutationEngine::ruleEpoch() const {
@@ -498,9 +545,34 @@ bool MutationEngine::setRuleValue(uint16_t rule_id, uint32_t value, uint32_t exp
     }
     MutationReadScope read_scope(mutation_readers_);
     if (expected_epoch != ruleEpoch() || !ruleExistsForControl(rule_id)) return false;
+    const RuleStageRequest* controlled = nullptr;
+    if (staged_ != nullptr && staged_[rule_id].in_use) {
+        controlled = &staged_[rule_id].request;
+    } else if (committed_shadow_ != nullptr) {
+        for (uint16_t i = 0; i < committed_count_; ++i) {
+            if (committed_shadow_[i].rule_id == rule_id) {
+                controlled = &committed_shadow_[i].request;
+                break;
+            }
+        }
+    }
+    if (controlled == nullptr || !runtimeValueFits(*controlled, value)) return false;
     if (staged_ != nullptr && staged_[rule_id].in_use && staged_[rule_id].publish_runtime_on_commit) {
         staged_[rule_id].pending_runtime_value = value;
         return true;
+    }
+    // Keep both shadows synchronized with a live adjustment. If the user later
+    // changes only the candidate enable state, that commit must not restore an
+    // older runtime value as a side effect.
+    if (staged_ != nullptr && staged_[rule_id].in_use) {
+        staged_[rule_id].pending_runtime_value = value;
+    }
+    if (committed_shadow_ != nullptr) {
+        for (uint16_t i = 0; i < committed_count_; ++i) {
+            if (committed_shadow_[i].rule_id == rule_id) {
+                committed_shadow_[i].pending_runtime_value = value;
+            }
+        }
     }
     runtime_state_[rule_id].current_value.store(value, std::memory_order_release);
     return true;
@@ -537,6 +609,82 @@ bool MutationEngine::enableRule(uint16_t rule_id, bool enabled, uint32_t expecte
     return true;
 }
 
+bool MutationEngine::setActiveRuleValue(uint16_t rule_id, uint32_t value, uint32_t expected_epoch) {
+    if (rule_id >= kMaxRules || !beginMutationRead()) return false;
+    MutationReadScope read_scope(mutation_readers_);
+    if (expected_epoch != ruleEpoch() || committed_shadow_ == nullptr) return false;
+
+    StagedRule* committed = nullptr;
+    for (uint16_t i = 0U; i < committed_count_; ++i) {
+        if (committed_shadow_[i].in_use && committed_shadow_[i].rule_id == rule_id) {
+            committed = &committed_shadow_[i];
+            break;
+        }
+    }
+    if (committed == nullptr || !runtimeValueFits(committed->request, value)) return false;
+
+    committed->pending_runtime_value = value;
+    if (staged_ != nullptr && staged_[rule_id].in_use && !staged_[rule_id].publish_runtime_on_commit) {
+        staged_[rule_id].pending_runtime_value = value;
+    }
+    runtime_state_[rule_id].current_value.store(value, std::memory_order_release);
+    return true;
+}
+
+bool MutationEngine::setActiveRuleEnabled(uint16_t rule_id, bool enabled, uint32_t expected_epoch) {
+    if (rule_id >= kMaxRules || !beginMutationRead()) return false;
+    MutationReadScope read_scope(mutation_readers_);
+    if (expected_epoch != ruleEpoch() || committed_shadow_ == nullptr) return false;
+
+    StagedRule* committed = nullptr;
+    for (uint16_t i = 0U; i < committed_count_; ++i) {
+        if (committed_shadow_[i].in_use && committed_shadow_[i].rule_id == rule_id) {
+            committed = &committed_shadow_[i];
+            break;
+        }
+    }
+    if (committed == nullptr) return false;
+
+    committed->request.enabled = enabled;
+    committed->pending_enabled = enabled;
+    if (staged_ != nullptr && staged_[rule_id].in_use && !staged_[rule_id].publish_runtime_on_commit) {
+        staged_[rule_id].request.enabled = enabled;
+        staged_[rule_id].pending_enabled = enabled;
+    }
+    runtime_state_[rule_id].enabled.store(enabled ? 1U : 0U, std::memory_order_release);
+    return true;
+}
+
+bool MutationEngine::setStagedRuleValue(uint16_t rule_id, uint32_t value, uint32_t expected_epoch) {
+    if (rule_id >= kMaxRules || !beginMutationRead()) {
+        return false;
+    }
+    MutationReadScope read_scope(mutation_readers_);
+    if (expected_epoch != ruleEpoch() || staged_ == nullptr || !staged_[rule_id].in_use) {
+        return false;
+    }
+    if (!runtimeValueFits(staged_[rule_id].request, value)) return false;
+    staged_[rule_id].pending_runtime_value = value;
+    staged_[rule_id].publish_runtime_on_commit = true;
+    staging_dirty_.store(1U, std::memory_order_release);
+    return true;
+}
+
+bool MutationEngine::setStagedRuleEnabled(uint16_t rule_id, bool enabled, uint32_t expected_epoch) {
+    if (rule_id >= kMaxRules || !beginMutationRead()) {
+        return false;
+    }
+    MutationReadScope read_scope(mutation_readers_);
+    if (expected_epoch != ruleEpoch() || staged_ == nullptr || !staged_[rule_id].in_use) {
+        return false;
+    }
+    staged_[rule_id].request.enabled = enabled;
+    staged_[rule_id].pending_enabled = enabled;
+    staged_[rule_id].publish_runtime_on_commit = true;
+    staging_dirty_.store(1U, std::memory_order_release);
+    return true;
+}
+
 void MutationEngine::clearRules() {
     clearStaging();
     static_cast<void>(applyCommit());
@@ -565,6 +713,14 @@ size_t MutationEngine::listRules(RuleListEntry* out_entries, size_t capacity) co
         dst.epoch = ruleEpoch();
         dst.request = src.source;
         dst.active = runtime_state_[src.rule_id].enabled.load(std::memory_order_acquire) != 0U;
+        if (dst.request.kind == RuleKind::BIT_RANGE && dst.request.dynamic_value) {
+            dst.request.replace_value = runtime_state_[src.rule_id].current_value.load(std::memory_order_acquire);
+        } else if (dst.request.kind == RuleKind::COUNTER) {
+            dst.request.counter_initial = runtime_state_[src.rule_id].current_value.load(std::memory_order_acquire);
+        } else if (dst.request.kind == RuleKind::SEQUENCE8) {
+            dst.request.sequence_initial_index = static_cast<uint8_t>(
+                runtime_state_[src.rule_id].current_value.load(std::memory_order_acquire));
+        }
     }
     return count;
 }
@@ -609,13 +765,18 @@ size_t MutationEngine::listStagedRules(RuleListEntry* out_entries, size_t capaci
         dst.request.enabled = src.pending_enabled;
         dst.active = src.pending_enabled;
 
-        // Dynamic bit-range controls may be adjusted after staging. Surface
-        // the value that would be committed, or the live value after commit,
-        // instead of the package's now-stale initial value.
+        // Runtime controls may be adjusted after staging. Surface the value
+        // that would be committed, or the live value after commit, instead of
+        // the package's now-stale initial state.
+        const uint32_t runtime_value = src.publish_runtime_on_commit
+            ? src.pending_runtime_value
+            : runtime_state_[src.rule_id].current_value.load(std::memory_order_acquire);
         if (src.request.kind == RuleKind::BIT_RANGE && src.request.dynamic_value) {
-            dst.request.replace_value = src.publish_runtime_on_commit
-                ? src.pending_runtime_value
-                : runtime_state_[src.rule_id].current_value.load(std::memory_order_acquire);
+            dst.request.replace_value = runtime_value;
+        } else if (src.request.kind == RuleKind::COUNTER) {
+            dst.request.counter_initial = runtime_value;
+        } else if (src.request.kind == RuleKind::SEQUENCE8) {
+            dst.request.sequence_initial_index = static_cast<uint8_t>(runtime_value);
         }
     }
     return count;
@@ -653,6 +814,10 @@ bool MutationEngine::normalizeRule(RuleStageRequest& rule) {
             return false;
         }
         if (rule.start_bit + rule.bit_length > 64U && rule.little_endian) {
+            return false;
+        }
+        if (rule.kind == RuleKind::BIT_RANGE && rule.bit_length < 64U &&
+            rule.replace_value >= (1ULL << rule.bit_length)) {
             return false;
         }
 
@@ -959,27 +1124,43 @@ bool MutationEngine::compileRule(const StagedRule& staged_rule, uint16_t priorit
 }
 
 void MutationEngine::applyCounterRule(const CompiledRule& rule, CanFrame& frame) const {
-    applyDynamicRule(rule, frame);
-    const uint32_t current = runtime_state_[rule.rule_id].current_value.load(std::memory_order_relaxed);
-    const uint32_t next = current >= rule.source.counter_wrap_after
-        ? rule.source.counter_wrap_to
-        : current + rule.source.counter_step;
-    runtime_state_[rule.rule_id].current_value.store(next, std::memory_order_relaxed);
+    uint8_t selector = 0U;
+    const bool selected = selectorAllows(rule, selector);
+
+    // Claim this frame's counter value and publish the next state in one
+    // atomic operation. A concurrent API write before the CAS participates in
+    // this frame; one after the CAS remains intact for the following frame.
+    uint32_t current = runtime_state_[rule.rule_id].current_value.load(std::memory_order_relaxed);
+    while (true) {
+        const uint32_t next = current >= rule.source.counter_wrap_after
+            ? rule.source.counter_wrap_to
+            : current + rule.source.counter_step;
+        if (runtime_state_[rule.rule_id].current_value.compare_exchange_weak(
+                current, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    if (selected) writeDynamicValue(rule, frame, current);
 }
 
 void MutationEngine::applySequenceRule(const CompiledRule& rule, CanFrame& frame) const {
-    const uint32_t index = runtime_state_[rule.rule_id].current_value.load(std::memory_order_relaxed);
-    const uint8_t safe_index = static_cast<uint8_t>(index % rule.source.sequence_count);
-    runtime_state_[rule.rule_id].current_value.store(
-        static_cast<uint32_t>((safe_index + 1U) % rule.source.sequence_count),
-        std::memory_order_relaxed);
-    // applyDynamicRule reads current_value, so temporarily publish the selected
-    // byte and then restore the next sequence index after applying it.
-    runtime_state_[rule.rule_id].current_value.store(rule.source.sequence_values[safe_index], std::memory_order_relaxed);
-    applyDynamicRule(rule, frame);
-    runtime_state_[rule.rule_id].current_value.store(
-        static_cast<uint32_t>((safe_index + 1U) % rule.source.sequence_count),
-        std::memory_order_relaxed);
+    uint8_t selector = 0U;
+    const bool selected = selectorAllows(rule, selector);
+
+    // current_value is public runtime state and must always remain an index;
+    // never place the emitted byte in that slot, even briefly. CAS also keeps
+    // a concurrent API Set from being overwritten by the frame task.
+    uint32_t index = runtime_state_[rule.rule_id].current_value.load(std::memory_order_relaxed);
+    uint8_t safe_index = 0U;
+    while (true) {
+        safe_index = static_cast<uint8_t>(index % rule.source.sequence_count);
+        const uint32_t next = static_cast<uint32_t>((safe_index + 1U) % rule.source.sequence_count);
+        if (runtime_state_[rule.rule_id].current_value.compare_exchange_weak(
+                index, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    if (selected) writeDynamicValue(rule, frame, rule.source.sequence_values[safe_index]);
 }
 
 void MutationEngine::applyXorChecksumRule(const CompiledRule& rule, CanFrame& frame) {
@@ -1021,7 +1202,8 @@ bool MutationEngine::selectorAllows(const CompiledRule& rule, uint8_t& selector)
     if (rule.selector_index < 0) return true;
     if (runtime_values_ == nullptr) return false;
     float raw = 0.0F;
-    if (!runtime_values_->read(static_cast<uint16_t>(rule.selector_index), raw) || raw < 0.0F || raw > 15.0F) {
+    if (!runtime_values_->read(static_cast<uint16_t>(rule.selector_index), raw) ||
+        !std::isfinite(raw) || raw < 0.0F || raw > 15.0F) {
         return false;
     }
     selector = static_cast<uint8_t>(raw + 0.5F);
@@ -1029,22 +1211,25 @@ bool MutationEngine::selectorAllows(const CompiledRule& rule, uint8_t& selector)
 }
 
 void MutationEngine::applyDynamicRule(const CompiledRule& rule, CanFrame& frame) const {
-    for (uint8_t i = 0; i < 8U; ++i) {
-        frame.data[i] = static_cast<uint8_t>(frame.data[i] & rule.clear_mask[i]);
-    }
-
     uint32_t value = runtime_state_[rule.rule_id].current_value.load(std::memory_order_relaxed);
     uint8_t selector = 0U;
+    // A selector is a gate, so an inactive rule must be a true no-op. Clearing
+    // the target field before this check would silently write zero.
     if (!selectorAllows(rule, selector)) return;
+    const uint32_t max_value = rule.dynamic_bit_count >= 32U
+        ? 0xFFFFFFFFU
+        : static_cast<uint32_t>((1ULL << rule.dynamic_bit_count) - 1ULL);
     if (rule.runtime_value_index >= 0 && runtime_values_ != nullptr) {
         float source = 0.0F;
         if (runtime_values_->read(static_cast<uint16_t>(rule.runtime_value_index), source)) {
+            if (!std::isfinite(source)) return;
             float override_active = 0.0F;
             float override_value = 0.0F;
-            const bool use_override = rule.override_active_index >= 0 && rule.override_value_index >= 0 &&
+            const bool override_available = rule.override_active_index >= 0 && rule.override_value_index >= 0 &&
                 runtime_values_->read(static_cast<uint16_t>(rule.override_active_index), override_active) &&
-                runtime_values_->read(static_cast<uint16_t>(rule.override_value_index), override_value) &&
-                override_active >= 0.5F;
+                runtime_values_->read(static_cast<uint16_t>(rule.override_value_index), override_value);
+            if (override_available && (!std::isfinite(override_active) || !std::isfinite(override_value))) return;
+            const bool use_override = override_available && override_active >= 0.5F;
             const bool selector_direct = rule.selector_index >= 0 &&
                 (rule.source.selector_direct_mask & static_cast<uint16_t>(1U << selector)) != 0U;
             const float output_scale = rule.source.selector_maps_output
@@ -1056,31 +1241,40 @@ void MutationEngine::applyDynamicRule(const CompiledRule& rule, CanFrame& frame)
             if (selector_direct) {
                 value = rule.source.selector_direct_output[selector];
             } else if (use_override) {
-                float transformed = override_value * output_scale + rule.source.output_offset;
-                if (transformed < 0.0F) transformed = 0.0F;
-                value = static_cast<uint32_t>(transformed + (rule.source.truncate_output ? 0.0F : 0.5F));
+                const double transformed = static_cast<double>(override_value) *
+                    static_cast<double>(output_scale) + static_cast<double>(rule.source.output_offset);
+                if (!encodeRuntimeOutput(transformed, rule.source.truncate_output, max_value, value)) return;
             } else if (rule.source.zero_override && source <= rule.source.zero_threshold) {
                 value = rule.source.zero_output;
             } else if (rule.source.full_override && source >= rule.source.full_threshold) {
                 value = full_output;
             } else {
-                float affine = (source * rule.source.source_gain) + rule.source.source_offset;
+                double affine = static_cast<double>(source) * static_cast<double>(rule.source.source_gain) +
+                    static_cast<double>(rule.source.source_offset);
                 uint32_t table_output = 0U;
                 if (rule.runtime_table_index >= 0 && runtime_tables_ != nullptr &&
                     runtime_tables_->lookupFirstAtLeast(
                         static_cast<uint16_t>(rule.runtime_table_index), source, table_output)) {
-                    affine = static_cast<float>(table_output);
+                    affine = static_cast<double>(table_output);
                 }
                 if (rule.source.truncate_affine) affine = std::floor(affine);
-                float transformed = affine * output_scale + rule.source.output_offset;
-                if (transformed < 0.0F) transformed = 0.0F;
-                const uint64_t max_value = (rule.dynamic_bit_count >= 32U)
-                    ? 0xFFFFFFFFULL
-                    : ((1ULL << rule.dynamic_bit_count) - 1ULL);
-                if (transformed > static_cast<float>(max_value)) transformed = static_cast<float>(max_value);
-                value = static_cast<uint32_t>(transformed + (rule.source.truncate_output ? 0.0F : 0.5F));
+                const double transformed = affine * static_cast<double>(output_scale) +
+                    static_cast<double>(rule.source.output_offset);
+                if (!encodeRuntimeOutput(transformed, rule.source.truncate_output, max_value, value)) return;
             }
         }
+    }
+    writeDynamicValue(rule, frame, value);
+}
+
+void MutationEngine::writeDynamicValue(const CompiledRule& rule, CanFrame& frame, uint32_t value) {
+    const uint32_t max_value = rule.dynamic_bit_count >= 32U
+        ? 0xFFFFFFFFU
+        : static_cast<uint32_t>((1ULL << rule.dynamic_bit_count) - 1ULL);
+    if (value > max_value) value = max_value;
+
+    for (uint8_t i = 0; i < 8U; ++i) {
+        frame.data[i] = static_cast<uint8_t>(frame.data[i] & rule.clear_mask[i]);
     }
     for (uint8_t bit = 0; bit < rule.dynamic_bit_count; ++bit) {
         if ((value & (1UL << bit)) == 0UL) {

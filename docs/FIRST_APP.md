@@ -93,7 +93,7 @@ You are now building an app on SignalScope: the core still owns CAN and decoding
 
 Only do this on the synthetic `0x321` learning network or after independently establishing the correct rule for your own controlled system.
 
-Select `OilTemperature` in the explorer and enter a physical value of `90`. The UI converts it using the DBC:
+Open the rule workstation's **Set a signal** mode, select `OilTemperature`, and choose a static value of `90`. The UI converts it using the DBC:
 
 ```text
 raw = (90 - (-40)) / 1 = 130
@@ -105,15 +105,19 @@ The equivalent package row is:
 STATIC,0x321,A_TO_B,0,8,1,130
 ```
 
+The Signal mode can also stage a manually adjustable dynamic `BIT_RANGE` with `dynamic=1`. That rule can be changed at runtime, but it exists only in RAM and is not a persistent `.ssrules` recipe. For this walkthrough, keep the static selection so the workstation can generate the `STATIC` row above.
+
 Now follow the state changes deliberately:
 
 1. **Stage** — the candidate appears, but forwarded bytes do not change.
 2. **Apply** — the complete staged table becomes active in RAM.
 3. Observe the output and confirm the mutation marker and expected decoded value.
-4. **Revert/clear** if it is not correct.
-5. **Save startup package** only after it is proven. That writes `/rules/active.ssrules`.
+4. **Revert/clear staging** if it is not correct.
+5. **Install startup package** only after it is proven. Installation validates the entire package, activates it, and stores `/rules/active.ssrules` in one transaction.
 
-Reboot once and confirm that a saved package loads. If you only applied it, the rule should not survive reboot.
+Reboot once and confirm that the installed package loads. If you only applied a draft, the rule should not survive reboot.
+
+The workstation's other modes are for different jobs. **Raw bits** stages a RAM-only `RAW_MASK` through the candidate table. **Advanced package** generates editable `SOURCE_INT`, `SOURCE_SELECT_INT`, bind, counter, sequence, XOR-checksum, and CRC-8/AUTOSAR-checksum recipes. Those recipes do nothing until the complete package is installed successfully.
 
 ## 7. Grow the app without rewriting CAN
 

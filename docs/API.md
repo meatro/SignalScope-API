@@ -181,7 +181,7 @@ curl.exe -X POST -d "rule_kind=RAW_MASK&can_id=0x321&direction=A_TO_B&mask=FF000
 
 `mask` and `value` are eight hex bytes. Separators accepted by the shared byte parser may vary; a continuous 16-hex-digit value is the least ambiguous.
 
-The same handler retains a legacy signal-mutation adapter when `operation` is supplied without `rule_kind`. Supported operation names are `REPLACE`, `PASS_THROUGH`, `ADD_OFFSET`, `MULTIPLY`, and `CLAMP`, with DBC-style factor/offset inputs. New applications should use explicit rule staging and packages because those map directly to the active rule model.
+The same handler retains a legacy signal-mutation adapter when `operation` is supplied without `rule_kind`. It still recognizes the historical operation names, but the current rule engine accepts only `REPLACE` and `PASS_THROUGH`. `ADD_OFFSET`, `MULTIPLY`, and `CLAMP` are parsed for compatibility and then rejected; they are not active runtime features. New applications should use explicit rule staging and packages because those map directly to the active rule model.
 
 ### `GET /api/rules` and `GET /api/rules?view=staging`
 
@@ -203,6 +203,7 @@ Both views return their rules and the current table epoch:
 {
   "ok": true,
   "count": 1,
+  "candidate_dirty": false,
   "rule_epoch": 12,
   "rules": [{
     "rule_id": 0,
@@ -217,8 +218,14 @@ Both views return their rules and the current table epoch:
     "length": 8,
     "little_endian": true,
     "dynamic": false,
+    "manual_dynamic": false,
+    "value_source": "",
     "replace_value": 130,
-    "replace_value_text": "130"
+    "replace_value_text": "130",
+    "runtime_value": 0,
+    "runtime_value_text": "0",
+    "runtime_value_kind": "none",
+    "sequence_count": 0
   }]
 }
 ```
@@ -229,6 +236,12 @@ numbers cannot represent every 64-bit integer exactly. `replace_value` remains
 for compatibility and convenience with ordinary-width rules.
 
 `enabled` tells whether that rule is enabled. `active` is retained as a compatibility alias for the same enabled state; it does **not** tell you whether a row came from the active or candidate table. The request URL selects the table, so a candidate editor should label every row from `?view=staging` as candidate regardless of `active`.
+
+`candidate_dirty` tells whether the candidate differs from the last committed table. A clean candidate is the editable mirror of Live now, not a second set of unapplied rules.
+
+For dynamic bit ranges, `manual_dynamic` is true only when `/api/rules/value` is a meaningful manual control. `value_source` names the application-published source for `SOURCE_INT`/`SOURCE_SELECT_INT`; those rows reject manual value writes because the source supplies their value on every matching frame.
+
+`runtime_value_kind` identifies the writable runtime state exposed through `/api/rules/value`: `raw` for a manual dynamic bit range, `counter_state` for the next counter value, `sequence_index` for the next sequence entry, or `none`. `runtime_value_text` is its exact decimal spelling. `sequence_count` bounds a sequence index.
 
 ### `POST /api/rules`
 
@@ -248,27 +261,27 @@ curl.exe -X POST -H "Content-Type: text/plain" --data "clear_rules" http://192.1
 
 ### `POST /api/rules/value`
 
-Changes a dynamic `BIT_RANGE` rule's current raw value. The table epoch is mandatory in practice:
+Changes a rule's writable runtime state: a manual dynamic `BIT_RANGE` raw value, a `COUNTER`'s next state, or a `SEQUENCE8` next-entry index. The table epoch is mandatory in practice. Add `view=staging` when editing a candidate so the change is guaranteed to wait for Apply:
 
 ```powershell
-curl.exe -X POST -d "rule_id=0&rule_epoch=12&value=42&enabled=1" `
+curl.exe -X POST -d "rule_id=0&rule_epoch=12&view=staging&value=42" `
   http://192.168.4.1/api/rules/value
 ```
 
-For a pending dynamic candidate, the value becomes its pending runtime value and is published by Apply. Otherwise it changes active runtime state. Static replacement rules are immutable rows; restage a static rule instead of calling `/value`.
+With `view=staging`, the value changes only the candidate and is published by Apply. Explicit `view=active` always targets the live rule even when another candidate edit is pending for the same slot. Omitting `view` retains the backward-compatible behavior in which a brand-new or pending slot receives the value. A sequence value is an index from zero through `sequence_count - 1`. Static and application-source replacements reject `/value`; restage a static rule or publish the registered application source instead.
 
 HTTP 409 with `stale_rule_handle` means the table changed. Fetch the same table view again and resolve the intended rule rather than retrying an old slot number.
 
 ### `POST /api/rules/enable`
 
 ```powershell
-curl.exe -X POST -d "rule_id=0&rule_epoch=12&enabled=0" `
+curl.exe -X POST -d "rule_id=0&rule_epoch=12&view=staging&enabled=0" `
   http://192.168.4.1/api/rules/enable
 ```
 
 The handler can also resolve a rule by CAN ID/direction/field identity, but stable clients should use the returned ID plus epoch and refresh on conflict.
 
-When a slot is pending commit, enabling or disabling it updates the candidate. This makes `/enable` appropriate for candidate-editor rows. The change does not affect live traffic until Apply.
+With `view=staging`, enabling or disabling a row changes only the RAM candidate and cannot affect live traffic until Apply. Explicit `view=active` always changes the live rule, even when a candidate for the same slot is pending. This does not rewrite `.ssrules` package source; edit or remove the corresponding package row when the choice must persist after reboot.
 
 ## Persistent rule packages
 

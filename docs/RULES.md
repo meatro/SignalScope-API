@@ -2,7 +2,13 @@
 
 Rules change selected bits only when a frame's CAN ID and physical direction match. SignalScope supports simple constant replacement, application-published values, selectors, counters, sequences, and checksum post-processing.
 
-Start with a static DBC-backed rule in the web interface. Use the text formats in this guide when you need versionable packages or a native application that publishes dynamic values.
+Start in the web rule workstation. Its three modes expose different parts of the same engine without pretending that every rule has the same lifetime:
+
+- **Set a signal** stages a `BIT_RANGE` using a DBC signal or manual bit coordinates. A static value can be emitted as a persistent `STATIC` package row. A manually adjustable dynamic value is staged with `dynamic=1`; it is RAM-only and must not be presented as a reboot-persistent package rule.
+- **Raw bits** stages an eight-byte `RAW_MASK`. It is useful for explicit pass-through/force-zero/force-one bit editing, but it is RAM-only because `.ssrules` has no `RAW_MASK` row.
+- **Advanced package** generates editable recipes for `SOURCE_INT`, `SOURCE_SELECT_INT`, `BIND_TABLE`, `BIND_OVERRIDE`, `BIND_ACTIVE`, `COUNTER`, `SEQUENCE8`, `CHECKSUM_XOR`, and `CHECKSUM_CRC8_AUTOSAR`. These recipes remain browser text until you install the package.
+
+The workstation does not expose the old `ADD_OFFSET`, `MULTIPLY`, or `CLAMP` controls. Those legacy request names are parsed by the compatibility adapter but rejected by the current rule engine.
 
 ## The four rule states
 
@@ -18,7 +24,7 @@ Applying is not saving.
 ```text
 POST /api/rules/stage    → candidate only
 POST /api/rules          → body: apply_commit → active RAM table
-POST /api/rules/package  → validate + activate + store .ssrules
+POST /api/rules/package  → validate + activate + store .ssrules in one transaction
 ```
 
 Read the tables separately:
@@ -32,6 +38,8 @@ The response field `enabled` describes whether a rule is enabled. The compatibil
 
 `revert` replaces the candidate/staging table with a copy of the active table. `clear_staging` empties only the candidate. `clear_rules` empties both active behavior and the host's selected-package state, but it does not delete an existing file from LittleFS.
 
+The API exposes `candidate_dirty` so editors can distinguish an unchanged candidate copy from real pending changes. Candidate enable toggles are RAM authoring controls; they do not rewrite package text. If a rule should stay absent or disabled after reboot, make that choice in the package source itself.
+
 ## Package locations and boot order
 
 Rule packages must be plain text, no larger than 64 KiB, with a path under `/rules/`, no traversal or hidden-path segments, and a `.ssrules` suffix.
@@ -43,7 +51,7 @@ Standalone boot tries:
 
 It does not automatically load every package in the directory. Keep other names for reusable profiles and select them explicitly through `/api/rules/select`.
 
-When a package is uploaded, the firmware:
+Installing a package is one validate/activate/store transaction. When a package is uploaded, the firmware:
 
 1. writes `/rules/upload.tmp.ssrules`;
 2. parses every non-comment row into the candidate/staging table;
@@ -51,7 +59,7 @@ When a package is uploaded, the firmware:
 4. removes the temporary file on failure;
 5. only after success, renames it to the requested path.
 
-An invalid row therefore cannot replace the last known-good startup file or partially alter the active table.
+An invalid row therefore cannot replace the last known-good startup file or partially alter the active table. Do not describe this action as merely “save”: a successful install both changes the active rule table and stores the startup package.
 
 ## Common syntax
 
@@ -89,7 +97,7 @@ Example: replace the synthetic `OilTemperature` byte on `0x321` with raw 130:
 STATIC,0x321,A_TO_B,0,8,1,130
 ```
 
-`STATIC` accepts a 64-bit raw value through the package parser. The web rule builder normally derives this value from the selected DBC signal.
+`STATIC` accepts an unsigned raw value up to 64 bits, and that value must fit the target field length. The web rule builder normally derives it from the selected DBC signal.
 
 ## Dynamic integer source
 
@@ -256,17 +264,17 @@ Fetch the table you intend to control, then use both `rule_id` and `rule_epoch`.
 
 ```text
 POST /api/rules/value
-rule_id=3&rule_epoch=12&value=42&enabled=true
+rule_id=3&rule_epoch=12&view=staging&value=42
 ```
 
 ```text
 POST /api/rules/enable
-rule_id=3&rule_epoch=12&enabled=false
+rule_id=3&rule_epoch=12&view=staging&enabled=false
 ```
 
-`/api/rules/value` applies only to dynamic `BIT_RANGE` rules. If that dynamic slot is pending commit, it changes the candidate's pending runtime value; otherwise it changes active runtime state. A static replacement is immutable, so restage it with the new value.
+`/api/rules/value` controls a manual dynamic `BIT_RANGE` raw value, a `COUNTER`'s next state, or a `SEQUENCE8` next-entry index. The rule listing exposes that state as `runtime_value`/`runtime_value_text` and identifies its meaning with `runtime_value_kind`; sequence indexes are bounded by `sequence_count`. `SOURCE_INT` and `SOURCE_SELECT_INT` reject manual writes because their application source is authoritative. `view=staging` changes the candidate; explicit `view=active` changes live runtime even if the same slot has pending candidate edits. A static replacement is immutable, so restage it with the new value.
 
-`/api/rules/enable` may enable or disable a pending candidate row. Its effect reaches live traffic only after Apply.
+`/api/rules/enable` with `view=staging` changes only the RAM candidate. Explicit `view=active` changes only live runtime. Omitting `view` retains legacy pending-slot behavior. None of these forms edits a stored `.ssrules` file.
 
 If the table epoch changed, the firmware returns HTTP 409. Fetch the same view again and resolve the intended rule rather than retrying an old handle blindly.
 
@@ -279,6 +287,6 @@ If the table epoch changed, the firmware returns HTTP 409. Fetch the same view a
 - Dynamic field/counter width: at most 32 bits.
 - Sequence field width: at most 8 bits; 1–16 entries.
 - Selector values: 0–15.
-- Runtime source, table, and selector names: up to 31 characters plus terminator in the current structs.
+- Runtime source, table, and selector names: 1-31 ASCII characters, beginning with a letter or underscore and continuing with letters, numbers, `_`, `.`, or `-`.
 
 Treat rejection as useful feedback. Do not work around a failed package by silently dropping the row; a complete table is safer and easier to reproduce than a partial success.

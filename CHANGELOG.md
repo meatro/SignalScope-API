@@ -15,6 +15,8 @@ This project follows a human-readable changelog. Until the standalone API stabil
 - Oil-temperature browser and native-extension examples.
 - A dependency-free local preview server for exploring the complete UI without ESP32 or CAN hardware.
 - Generic gateway, mutation-transaction, signal-catalog, diagnostic-transport, packed-DBC, replay, and session-log regression coverage.
+- A progressive rule workstation with fixed and live-adjustable fields, a visual 64-bit raw-mask editor, and guided generators for source, selector, binding, counter, sequence, XOR, and CRC-8/AUTOSAR package rows.
+- Draft value and enable edits are isolated from live runtime state, rejected package installs restore the active candidate mirror, and the API reports whether a candidate is actually dirty.
 
 ### Changed
 
@@ -25,6 +27,7 @@ This project follows a human-readable changelog. Until the standalone API stabil
 - Packed DBC loading uses the neutral `SSDB` identity while retaining read compatibility with the earlier packed-header marker.
 - Parked-power terminology describes physical primary-side traffic rather than one vehicle topology.
 - Rule inspection now distinguishes the active runtime table from the candidate table explicitly; browser-safe responses also include exact decimal text for 64-bit replacement values.
+- Rule actions now name the authored, draft, live, and startup-package states explicitly, and unsupported staged rule kinds are rejected instead of silently becoming bit-range rules.
 
 ### Architecture
 
