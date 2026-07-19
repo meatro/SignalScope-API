@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Oil temperature · SignalScope</title>
+  <style>
+    /* This example is self-contained so it can be copied into data/ unchanged. */
+    :root {
+      color-scheme: light;
+      --bg: #eef2f8;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #63708a;
+      --line: #d9e0ec;
+      --accent: #5a4ff3;
+      --live: #16815a;
+      --stale: #a86200;
+      --bad: #b43b4d;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg: #0e1420;
+        --panel: #171f2e;
+        --text: #edf2ff;
+        --muted: #aab5cc;
+        --line: #2d384d;
+        --accent: #9189ff;
+        --live: #55d29f;
+        --stale: #f4b85e;
+        --bad: #ff8291;
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 15% 10%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 36rem),
+        var(--bg);
+    }
+
+    main { width: min(100%, 460px); }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-size: .78rem;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .card {
+      padding: clamp(22px, 6vw, 34px);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: var(--panel);
+      box-shadow: 0 18px 60px rgb(0 0 0 / .12);
+    }
+
+    .topline {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    h1 { margin: 0; font-size: clamp(1.3rem, 6vw, 1.7rem); }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 34px;
+      padding: 7px 11px;
+      border: 1px solid currentColor;
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: .78rem;
+      font-weight: 750;
+    }
+
+    .badge::before {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      content: "";
+    }
+
+    .badge[data-state="live"] { color: var(--live); }
+    .badge[data-state="stale"] { color: var(--stale); }
+    .badge[data-state="error"] { color: var(--bad); }
+
+    .reading {
+      display: flex;
+      align-items: baseline;
+      justify-content: center;
+      gap: 8px;
+      margin: 44px 0 38px;
+    }
+
+    .value {
+      font-size: clamp(4rem, 22vw, 7.2rem);
+      font-variant-numeric: tabular-nums;
+      font-weight: 780;
+      letter-spacing: -.07em;
+      line-height: .8;
+    }
+
+    .unit { color: var(--muted); font-size: 1.2rem; font-weight: 700; }
+
+    dl {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px 20px;
+      margin: 0;
+      padding-top: 20px;
+      border-top: 1px solid var(--line);
+      font-size: .9rem;
+    }
+
+    dt { color: var(--muted); }
+    dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; text-align: right; }
+
+    .message {
+      min-height: 2.8em;
+      margin: 20px 0 0;
+      color: var(--muted);
+      font-size: .86rem;
+      line-height: 1.45;
+    }
+
+    footer { margin: 16px 4px 0; color: var(--muted); font-size: .78rem; text-align: center; }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">SignalScope example app</p>
+    <section class="card" aria-labelledby="title">
+      <div class="topline">
+        <h1 id="title">Oil temperature</h1>
+        <span id="state" class="badge" data-state="loading">Connecting</span>
+      </div>
+
+      <div class="reading" aria-live="polite">
+        <span id="value" class="value">—</span>
+        <span class="unit">°C</span>
+      </div>
+
+      <dl>
+        <dt>Signal</dt><dd id="signal">OilTemperature</dd>
+        <dt>Source</dt><dd id="source">—</dd>
+        <dt>Sample age</dt><dd id="age">—</dd>
+      </dl>
+
+      <p id="message" class="message">Waiting for the active DBC and a matching frame.</p>
+    </section>
+    <footer>CAN transport and decoding by SignalScope · UI behavior belongs to this app</footer>
+  </main>
+
+  <script>
+    'use strict';
+
+    // Change this when your verified DBC uses another signal name. A larger app
+    // should let the user select from the catalog and persist CAN ID + name.
+    const SIGNAL_NAME = 'OilTemperature';
+    const POLL_MS = 1000;
+
+    const view = {
+      state: document.querySelector('#state'),
+      value: document.querySelector('#value'),
+      signal: document.querySelector('#signal'),
+      source: document.querySelector('#source'),
+      age: document.querySelector('#age'),
+      message: document.querySelector('#message')
+    };
+
+    let requestInFlight = false;
+
+    function renderState(label, state, message) {
+      view.state.textContent = label;
+      view.state.dataset.state = state;
+      view.message.textContent = message;
+    }
+
+    function renderUnavailable(message) {
+      view.value.textContent = '—';
+      view.source.textContent = '—';
+      view.age.textContent = '—';
+      renderState('Unavailable', 'error', message);
+    }
+
+    async function update() {
+      if (requestInFlight || document.hidden) return;
+      requestInFlight = true;
+      try {
+        const url = `/api/signal_catalog?q=${encodeURIComponent(SIGNAL_NAME)}&limit=32`;
+        const response = await fetch(url, { cache: 'no-store' });
+        const body = await response.json();
+        if (!response.ok || body.ok === false) throw new Error(body.error || `HTTP ${response.status}`);
+
+        // Match exactly instead of silently binding to the first fuzzy search hit.
+        const signal = body.signals.find(item => item.name === SIGNAL_NAME);
+        if (!signal) {
+          renderUnavailable(`The active DBC does not contain ${SIGNAL_NAME}. Load the correct DBC or change SIGNAL_NAME.`);
+          return;
+        }
+
+        view.signal.textContent = signal.name;
+        view.source.textContent = signal.direction
+          ? `${signal.canIdHex} · ${signal.direction}`
+          : signal.canIdHex;
+        view.age.textContent = Number.isFinite(signal.ageMs) ? `${signal.ageMs} ms` : 'no frame';
+
+        if (!signal.valid || !Number.isFinite(signal.value)) {
+          renderUnavailable('The signal definition exists, but no decodable physical frame is available yet.');
+          return;
+        }
+
+        view.value.textContent = Number(signal.value).toFixed(0);
+        if (signal.live) {
+          renderState('Live', 'live', 'Recent physical traffic decoded with the active DBC.');
+        } else {
+          renderState('Stale', 'stale', 'The last value is displayed for context, but its source frame is no longer live.');
+        }
+      } catch (error) {
+        renderUnavailable(`SignalScope request failed: ${error.message}`);
+      } finally {
+        requestInFlight = false;
+      }
+    }
+
+    view.signal.textContent = SIGNAL_NAME;
+    update();
+    setInterval(update, POLL_MS);
+    document.addEventListener('visibilitychange', update);
+  </script>
+</body>
+</html>

@@ -6,10 +6,15 @@ namespace bored::signalscope {
 
 void ObservationManager::init() {
     mode_.store(ObservationMode::NONE, std::memory_order_relaxed);
+    readers_.store(0U, std::memory_order_relaxed);
     clearTable(specific_tables_[0]);
     clearTable(specific_tables_[1]);
+    clearTable(mandatory_tables_[0]);
+    clearTable(mandatory_tables_[1]);
     active_specific_index_ = 0;
+    active_mandatory_index_ = 0;
     active_specific_.store(&specific_tables_[active_specific_index_], std::memory_order_release);
+    active_mandatory_.store(&mandatory_tables_[active_mandatory_index_], std::memory_order_release);
 }
 
 ObservationMode ObservationManager::mode() const {
@@ -21,16 +26,27 @@ void ObservationManager::setMode(ObservationMode mode) {
 }
 
 bool ObservationManager::isObserved(uint32_t can_id, Direction direction) const {
+    readers_.fetch_add(1U, std::memory_order_acq_rel);
+    const SpecificTable* mandatory = activeMandatoryTable();
+    if (mandatory != nullptr && contains(*mandatory, can_id, direction)) {
+        readers_.fetch_sub(1U, std::memory_order_acq_rel);
+        return true;
+    }
+
     const ObservationMode mode = mode_.load(std::memory_order_acquire);
     if (mode == ObservationMode::ALL) {
+        readers_.fetch_sub(1U, std::memory_order_acq_rel);
         return true;
     }
     if (mode == ObservationMode::NONE) {
+        readers_.fetch_sub(1U, std::memory_order_acq_rel);
         return false;
     }
 
     const SpecificTable* table = activeSpecificTable();
-    return (table != nullptr) && contains(*table, can_id, direction);
+    const bool observed = (table != nullptr) && contains(*table, can_id, direction);
+    readers_.fetch_sub(1U, std::memory_order_acq_rel);
+    return observed;
 }
 
 bool ObservationManager::setSpecific(const ObservationKey* keys, size_t count) {
@@ -41,6 +57,7 @@ bool ObservationManager::setSpecific(const ObservationKey* keys, size_t count) {
         return false;
     }
 
+    waitForReaders();
     SpecificTable* next = inactiveSpecificTable();
     if (next == nullptr) {
         return false;
@@ -96,6 +113,7 @@ bool ObservationManager::removeSpecific(uint32_t can_id, Direction direction) {
 }
 
 void ObservationManager::clearSpecific() {
+    waitForReaders();
     SpecificTable* next = inactiveSpecificTable();
     if (next == nullptr) {
         return;
@@ -106,17 +124,67 @@ void ObservationManager::clearSpecific() {
 }
 
 size_t ObservationManager::snapshotSpecific(ObservationKey* out_keys, size_t capacity) const {
-    if (out_keys == nullptr || capacity == 0U) {
-        return 0U;
-    }
+    readers_.fetch_add(1U, std::memory_order_acq_rel);
+    const size_t count = snapshotTable(activeSpecificTable(), out_keys, capacity);
+    readers_.fetch_sub(1U, std::memory_order_acq_rel);
+    return count;
+}
 
-    const SpecificTable* table = activeSpecificTable();
-    if (table == nullptr) {
-        return 0U;
+bool ObservationManager::addMandatory(uint32_t can_id, Direction direction) {
+    ObservationKey keys[kMaxSpecificKeys];
+    const size_t count = snapshotMandatory(keys, kMaxSpecificKeys);
+    if (count >= kMaxSpecificKeys) return false;
+    for (size_t i = 0U; i < count; ++i) {
+        if (keys[i].can_id == can_id && keys[i].direction == direction) return true;
     }
+    keys[count] = ObservationKey{can_id, direction};
+    waitForReaders();
+    SpecificTable* next = inactiveMandatoryTable();
+    if (next == nullptr || !buildTable(*next, keys, count + 1U)) return false;
+    swapActiveMandatoryTable();
+    return true;
+}
 
-    const size_t count = (table->count < capacity) ? table->count : capacity;
-    for (size_t i = 0; i < count; ++i) {
+bool ObservationManager::removeMandatory(uint32_t can_id, Direction direction) {
+    ObservationKey keys[kMaxSpecificKeys];
+    const size_t count = snapshotMandatory(keys, kMaxSpecificKeys);
+    size_t write = 0U;
+    bool removed = false;
+    for (size_t i = 0U; i < count; ++i) {
+        if (keys[i].can_id == can_id && keys[i].direction == direction) {
+            removed = true;
+        } else {
+            keys[write++] = keys[i];
+        }
+    }
+    if (!removed) return true;
+    waitForReaders();
+    SpecificTable* next = inactiveMandatoryTable();
+    if (next == nullptr || !buildTable(*next, keys, write)) return false;
+    swapActiveMandatoryTable();
+    return true;
+}
+
+void ObservationManager::clearMandatory() {
+    waitForReaders();
+    SpecificTable* next = inactiveMandatoryTable();
+    if (next == nullptr) return;
+    clearTable(*next);
+    swapActiveMandatoryTable();
+}
+
+size_t ObservationManager::snapshotMandatory(ObservationKey* out_keys, size_t capacity) const {
+    readers_.fetch_add(1U, std::memory_order_acq_rel);
+    const size_t count = snapshotTable(activeMandatoryTable(), out_keys, capacity);
+    readers_.fetch_sub(1U, std::memory_order_acq_rel);
+    return count;
+}
+
+size_t ObservationManager::snapshotTable(
+    const SpecificTable* table, ObservationKey* out_keys, size_t capacity) {
+    if (table == nullptr || out_keys == nullptr || capacity == 0U) return 0U;
+    const size_t count = table->count < capacity ? table->count : capacity;
+    for (size_t i = 0U; i < count; ++i) {
         out_keys[i].can_id = table->entries[i].can_id;
         out_keys[i].direction = table->entries[i].direction;
     }
@@ -185,6 +253,13 @@ bool ObservationManager::buildTable(SpecificTable& table, const ObservationKey* 
     return true;
 }
 
+void ObservationManager::waitForReaders() const {
+    // Readers run only around a small fixed-table lookup/copy on the CAN task.
+    // Writers are low-priority configuration paths and may wait; CAN never does.
+    while (readers_.load(std::memory_order_acquire) != 0U) {
+    }
+}
+
 const ObservationManager::SpecificTable* ObservationManager::activeSpecificTable() const {
     return active_specific_.load(std::memory_order_acquire);
 }
@@ -199,5 +274,18 @@ void ObservationManager::swapActiveSpecificTable() {
     active_specific_.store(&specific_tables_[active_specific_index_], std::memory_order_release);
 }
 
-}  // namespace bored::signalscope
+const ObservationManager::SpecificTable* ObservationManager::activeMandatoryTable() const {
+    return active_mandatory_.load(std::memory_order_acquire);
+}
 
+ObservationManager::SpecificTable* ObservationManager::inactiveMandatoryTable() {
+    const uint8_t next_index = active_mandatory_index_ == 0U ? 1U : 0U;
+    return &mandatory_tables_[next_index];
+}
+
+void ObservationManager::swapActiveMandatoryTable() {
+    active_mandatory_index_ = active_mandatory_index_ == 0U ? 1U : 0U;
+    active_mandatory_.store(&mandatory_tables_[active_mandatory_index_], std::memory_order_release);
+}
+
+}  // namespace bored::signalscope

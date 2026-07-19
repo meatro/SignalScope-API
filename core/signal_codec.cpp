@@ -44,6 +44,26 @@ uint16_t nextMotorolaBit(uint16_t current) {
     return static_cast<uint16_t>(current - 1U);
 }
 
+bool signalFitsPayload(
+    uint8_t dlc,
+    uint16_t start_bit,
+    uint8_t length,
+    bool little_endian) {
+
+    if (dlc > 8U || length == 0U || length > 64U) return false;
+    const uint16_t payload_bits = static_cast<uint16_t>(dlc) * 8U;
+    if (little_endian) {
+        return start_bit < payload_bits &&
+            static_cast<uint32_t>(start_bit) + length <= payload_bits;
+    }
+    uint16_t bit_index = start_bit;
+    for (uint8_t i = 0U; i < length; ++i) {
+        if (bit_index >= payload_bits) return false;
+        bit_index = nextMotorolaBit(bit_index);
+    }
+    return true;
+}
+
 bool extractRaw(
     const uint8_t data[8],
     uint16_t start_bit,
@@ -201,6 +221,9 @@ bool encodeSignalRaw(
 }
 
 bool decodeSignal(const CanFrame& frame, const DbcSignalDef& signal, float& out_value) {
+    if (!signalFitsPayload(frame.dlc, signal.start_bit, signal.length, signal.little_endian)) {
+        return false;
+    }
     return decodeSignalRaw(
         frame.data,
         signal.start_bit,
