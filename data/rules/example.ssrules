@@ -1,0 +1,3 @@
+# Synthetic example: replace OilTemperature in CAN 0x321 with raw 130 (90 degC).
+# It is not loaded automatically. Use only with the synthetic example network.
+STATIC,0x321,A_TO_B,0,8,1,130

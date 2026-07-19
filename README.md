@@ -1,372 +1,160 @@
 # SignalScope
 
-SignalScope is an API-first, deterministic message-level CAN gateway runtime for ESP32-class boards.
+SignalScope is an ESP32-S3 framework for turning CAN-bus discoveries into small, purpose-built applications.
 
-It is designed so CAN forwarding/mutation/replay stay deterministic, while UI/client logic remains replaceable.
+At the simplest level, the workflow is:
 
-## What This Project Is
+1. Load a DBC so raw frame bits have useful names and units.
+2. Watch those signals change on a real or simulated network.
+3. Describe a frame change as a rule, test it, and save it as a package.
+4. Replace or extend the included HTML interface with the app you actually wanted to build.
 
-- Dual-CAN inline gateway runtime (forward A->B and B->A)
-- Deterministic mutation engine (`BIT_RANGE`, `RAW_MASK`) with stage/commit model
-- Replay engine that runs through the same gateway pipeline
-- Optional DBC load + demand-driven decode (observation controlled)
-- HTTP API + web UI served from LittleFS
+You do not have to rewrite CAN forwarding, DBC decoding, frame caching, rule scheduling, logging, replay, or the device web server for every idea. SignalScope supplies those pieces. Your application supplies the behavior, configuration, and user experience.
 
-## What This Project Is Not
+An oil-temperature display can be a few lines of browser JavaScript. A tuning interface can publish runtime values into dynamic rules. A controller can add its own state machine through the application-extension API. They all use the same transport and mutation engine.
 
-- Not tied to one product behavior (no product-specific CAN logic in core engine)
-- Not a cloud service (local AP + local HTTP API)
+## Who it is for
 
-## Hardware and Runtime Defaults
+SignalScope is intentionally useful at two different depths:
 
-Current default target in this repo:
-- ESP32-S3 board profile: `esp32-s3-devkitc1-n16r8`
-- Bus A: native ESP32 TWAI
-- Bus B: MCP2515 over SPI
+- If you are new to CAN, the web interface gives you a visible path from “this value changes when I press the pedal” to a named signal and a reusable rule.
+- If you already build embedded systems, the core provides a bounded, two-bus gateway, transactional rule tables, signal subscriptions, logging, replay, diagnostics transport, and a native C++ extension boundary.
 
-Core pinning selector (current code):
-- `kUseDualCore = true` (default): CAN/runtime core `1`, UI/server core `0`
-- `kUseDualCore = false`: both runtime tasks pinned to core `0`
-- On single-core targets, runtime automatically falls back to core `0` even if `kUseDualCore=true`
+You can start in the browser and only move into C++ when your application truly needs its own real-time logic.
 
-Dual-core is recommended for headroom, but single-core scheduling is supported.
+## What SignalScope is—and is not
 
-## Quick Start
+SignalScope owns the reusable infrastructure:
 
-### 1) Build Prerequisites
+- bidirectional CAN forwarding between Bus A and Bus B;
+- raw and decoded frame observation;
+- DBC parsing and signal catalogs;
+- staged, atomic mutation-rule changes;
+- persistent `.ssrules` packages;
+- session recording and dry-run replay;
+- HTTP APIs and static-file hosting;
+- optional application services for runtime values, diagnostics, and power policy.
 
-- PlatformIO CLI (or VSCode + PlatformIO extension)
-- USB serial access to your ESP32-S3 board
+An application owns the meaning:
 
-### 2) Flash Firmware + Filesystem
+- which DBC and signals are appropriate for its hardware;
+- which rules are valid for its feature;
+- its modes, maps, limits, and configuration;
+- its UI, terminology, and user workflow;
+- any validation required before it acts.
 
-From repo root:
+SignalScope does not ship vehicle-specific control logic or a universal CAN database. A DBC describes a particular network; it is evidence to verify, not permission to transmit. The bundled `data/dbc/default.dbc` is a synthetic learning example, not a vehicle definition.
+
+OpenHaldex is one showcase of what can be built on this framework. It is not part of the standalone SignalScope core, rule packages, or web interface.
+
+## Quick start
+
+The included PlatformIO environment currently targets the ESP32-S3 N16R8/T-2CAN-style hardware configuration used by this project. Pin assignments and both 500 kbit/s CAN interfaces are defined near the top of `main.cpp`. Confirm those assignments before adapting another board.
+
+Requirements:
+
+- Visual Studio Code with PlatformIO, or PlatformIO Core on the command line;
+- a data-capable USB cable;
+- the supported ESP32-S3 board and two CAN transceivers/interfaces;
+- a controlled bench network or other network you are authorized to test.
+
+Build and upload the firmware:
 
 ```powershell
-platformio run -t upload
-platformio run -t uploadfs
+pio run -e lilygo-t2can
+pio run -e lilygo-t2can -t upload
 ```
 
-If filesystem/partition state is questionable:
+Upload the LittleFS web interface, starter DBC, and example rule package:
 
 ```powershell
-platformio run -t erase
-platformio run -t upload
-platformio run -t uploadfs
+pio run -e lilygo-t2can -t uploadfs
 ```
 
-### 3) Connect
+Optional serial monitor:
 
-- SSID: `SignalScope-AP`
-- Password: `signalscope`
-- URL: `http://192.168.4.1/`
+```powershell
+pio device monitor -b 115200
+```
 
-## Project Layout
+To explore the complete interface before connecting hardware, run the local
+in-memory preview instead. It serves realistic API responses but cannot write
+to a physical CAN bus:
 
-- `main.cpp`: board wiring, CAN drivers, task runtime split, HTTP handlers
-- `core/`: gateway, mutation, replay, DBC parser, frame/signal caches
-- `fs/`: persistence abstraction
-- `data/`: LittleFS web assets
-- `boards/`: custom board JSON definitions
-- `ARCH.md`: architecture notes and runtime behavior
+```powershell
+python tools/preview_ui.py
+```
 
-## API Overview
+Open `http://127.0.0.1:8765/`, then click through the same workflow you will
+use on the device.
 
-Base URL on AP network:
+After boot, join the device access point:
 
 ```text
-http://192.168.4.1
+SSID: SignalScope-AP
+Password: signalscope
+Address: http://192.168.4.1/
 ```
 
-Request content types used by current handlers:
-- `GET` query params for reads
-- `application/x-www-form-urlencoded` for most POST field-based writes
-- `text/plain` for body-token actions and DBC/CSV uploads
+Then follow the four cards in the interface: **Load DBC → Explore → Build rule → Apply/save**.
 
-### Core Endpoints
+For a first connection and troubleshooting checklist, continue with [Getting started](docs/GETTING_STARTED.md). For a complete beginner project, use [Build an oil-temperature app](docs/FIRST_APP.md).
 
-#### `GET /api/status`
+## The rule lifecycle in one minute
 
-Returns gateway stats, queue/drop counters, DBC/replay state, active/staging rule counts, and recent frame events.
-
-Example:
-
-```powershell
-curl "http://192.168.4.1/api/status"
-```
-
-#### `GET /api/frame_cache?limit=<n>`
-
-Returns frame cache snapshot keyed by `(can_id, direction)`.
-
-- `limit`: optional, capped by firmware status frame limit
-
-Example:
-
-```powershell
-curl "http://192.168.4.1/api/frame_cache?limit=40"
-```
-
-#### `GET /api/signal_cache?indexes=0,1,2`
-
-Returns decoded signal cache snapshots.
-
-- `indexes`: optional CSV of signal indexes; omit for full snapshot
-
-Example:
-
-```powershell
-curl "http://192.168.4.1/api/signal_cache?indexes=0,1,2"
-```
-
-#### `POST /api/observe`
-
-Controls frame observation/decode mode.
-
-Fields:
-- `mode`: `none` | `specific` | `all`
-- `ids`: CSV of `can_id:direction` entries for `specific` mode
-  - Example token: `0x280:A_TO_B`
-
-Example:
-
-```powershell
-curl -X POST "http://192.168.4.1/api/observe" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  --data "mode=specific&ids=0x280:A_TO_B,0x1A0:B_TO_A"
-```
-
-## Rules and Mutation API
-
-### `POST /api/rules/stage`
-
-Stages a mutation rule (does not activate until commit).
-
-`BIT_RANGE` fields:
-- `rule_kind=BIT_RANGE`
-- `can_id`, `direction`
-- `start_bit`, `length`
-- `replace_value`
-- `little_endian` (optional, default true)
-- `dynamic` (optional, default false)
-- `enabled` (optional, default true)
-
-Example (`BIT_RANGE`):
-
-```powershell
-curl -X POST "http://192.168.4.1/api/rules/stage" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  --data "rule_kind=BIT_RANGE&can_id=0x280&direction=A_TO_B&start_bit=0&length=8&replace_value=5&enabled=1"
-```
-
-`RAW_MASK` fields:
-- `rule_kind=RAW_MASK`
-- `can_id`, `direction`
-- `mask` (16 hex chars = 8 bytes)
-- `value` (16 hex chars = 8 bytes)
-- `enabled` (optional)
-
-Example (`RAW_MASK`):
-
-```powershell
-curl -X POST "http://192.168.4.1/api/rules/stage" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  --data "rule_kind=RAW_MASK&can_id=0x280&direction=A_TO_B&mask=00000000000000FF&value=0000000000000001&enabled=1"
-```
-
-### `POST /api/rules`
-
-Rule table actions via plain body token:
-- `apply_commit`
-- `revert`
-- `clear_staging`
-- `clear_rules`
-
-Example:
-
-```powershell
-curl -X POST "http://192.168.4.1/api/rules" \
-  -H "Content-Type: text/plain" \
-  --data-binary "apply_commit"
-```
-
-### `GET /api/rules`
-
-Returns current active rule list.
-
-```powershell
-curl "http://192.168.4.1/api/rules"
-```
-
-### `POST /api/rules/value`
-
-Updates dynamic value for a rule.
-
-Fields:
-- `rule_id`
-- `value`
-- `enabled` (optional)
-
-```powershell
-curl -X POST "http://192.168.4.1/api/rules/value" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  --data "rule_id=3&value=42"
-```
-
-### `POST /api/rules/enable`
-
-Enable/disable a rule by `rule_id`, or identity fields.
-
-```powershell
-curl -X POST "http://192.168.4.1/api/rules/enable" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  --data "rule_id=3&enabled=0"
-```
-
-## Replay API
-
-### `POST /api/replay/load`
-
-Loads replay CSV into replay buffer.
-
-- Body: CSV text (`text/plain`)
-- Optional field/query: `direction` default if CSV line omits direction
-
-```powershell
-curl -X POST "http://192.168.4.1/api/replay/load?direction=A_TO_B" \
-  -H "Content-Type: text/plain" \
-  --data-binary "0,0x280,8,00,01,02,03,04,05,06,07,A_TO_B"
-```
-
-### `POST /api/replay`
-
-Replay control endpoint.
-
-Supported styles:
-- legacy body token (`text/plain`): `start`, `stop`, optional loop token
-- form fields (`application/x-www-form-urlencoded`):
-  - `action=start|stop`
-  - `loop_mode=PLAY_ONCE|LOOP_RAW|LOOP_WITH_COUNTER_CONTINUATION`
-  - `start_delay_us=<microseconds>`
-
-Examples:
-
-```powershell
-curl -X POST "http://192.168.4.1/api/replay" -H "Content-Type: text/plain" --data-binary "start"
-curl -X POST "http://192.168.4.1/api/replay" -H "Content-Type: text/plain" --data-binary "start LOOP_RAW"
-curl -X POST "http://192.168.4.1/api/replay" -H "Content-Type: text/plain" --data-binary "stop"
-curl -X POST "http://192.168.4.1/api/replay" -H "Content-Type: application/x-www-form-urlencoded" --data "action=start&loop_mode=LOOP_RAW&start_delay_us=50000"
-```
-
-### `POST /api/replay/send`
-
-Convenience send endpoint that builds replay frames internally and optionally starts playback immediately.
-
-Fields:
-- `can_id`, `direction`, `dlc`
-- `data` (16 hex chars = 8 bytes)
-- `repeat` (1..256)
-- `interval_us`
-- `start_delay_us`
-- `auto_start` (`1` or `0`)
-
-Example:
-
-```powershell
-curl -X POST "http://192.168.4.1/api/replay/send" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  --data "can_id=0x280&direction=A_TO_B&dlc=8&data=0001020304050607&repeat=10&interval_us=10000&start_delay_us=50000&auto_start=1"
-```
-
-### Replay CSV Format
-
-Per line:
+SignalScope separates trying a change from making it a startup configuration:
 
 ```text
-timestamp_us,can_id,dlc,b0,b1,b2,b3,b4,b5,b6,b7[,direction]
+author fields
+    ↓
+stage rule              no effect on forwarded frames
+    ↓
+apply commit            active now, in RAM
+    ↓
+save active.ssrules     validated, active now, and loaded next boot
 ```
 
-- `timestamp_us`: integer microseconds
-- `can_id`: decimal or hex (`0x...`)
-- `dlc`: 0..8
-- `b0..b7`: hex byte values
-- `direction` optional: `A_TO_B` or `B_TO_A`
+`Apply` is deliberately not called `Save`: an applied rule is lost on reboot unless you write a valid package to `/rules/active.ssrules` (or provide `/rules/default.ssrules`). Uploading a package through the API validates every row before the firmware promotes it.
 
-## DBC API
+See [Rules and packages](docs/RULES.md) for exact formats and [HTTP API](docs/API.md) for programmatic access.
 
-### `POST /api/dbc`
+## Make it your app
 
-Loads DBC text from request body (`text/plain`).
+There are two supported ways to build on SignalScope:
 
-If body is empty and `/dbc/active.dbc` exists, firmware attempts loading that file.
+1. **Browser application:** edit the dependency-free files in `data/`. Fetch decoded values from `/api/signal_catalog` or `/api/signal_cache`, then present them however your app needs.
+2. **Native application extension:** provide a strong `registerSignalScopeApplication(...)` definition and register callbacks. The extension can subscribe to signals, publish runtime values/tables, submit diagnostic jobs, annotate logs, and expose app-specific status/config/resources through generic host routes.
 
-On successful DBC load, runtime resets DBC-related state:
-- signal cache reset
-- subscriptions cleared
-- observation mode reset to `none`
-- replay stopped
-- rules cleared
+The browser path is ideal for dashboards and simple tools. The extension path is for application state that must remain on-device, run without a connected phone, or feed the rule engine predictably.
 
-```powershell
-curl -X POST "http://192.168.4.1/api/dbc" \
-  -H "Content-Type: text/plain" \
-  --data-binary "$(Get-Content .\data\dbc\vw_pq.dbc -Raw)"
-```
+Start with [Application extension](docs/APPLICATION_EXTENSION.md) and the commented examples in `examples/`.
 
-### `POST /api/dbc/autoload`
+## Practical test discipline
 
-Forces a rescan/autoload from the `/dbc` folder using the same boot order.
+SignalScope provides powerful transmit and mutation functions without imposing vehicle-generation gates or pretending to know your project. Use that freedom deliberately:
 
-Example:
+- establish a passive baseline before applying a rule;
+- verify the DBC value against something physically observable;
+- use replay with `dry_run=1` first;
+- test one change at a time on a bench or stationary system;
+- keep a known-good package and a direct way to remove device power;
+- do not edit maps or rules while driving;
+- use only on networks and vehicles you own or have permission to test.
 
-```powershell
-curl -X POST "http://192.168.4.1/api/dbc/autoload"
-```
+This is development equipment, not a certified safety controller or a substitute for engineering judgment.
 
-### DBC Auto-Load at Boot
+## Documentation map
 
-First valid file wins:
-1. `/dbc/active.dbc`
-2. `/dbc/default.dbc`
-3. `/dbc/vw_pq.dbc`
-4. first `*.dbc` found in `/dbc`
-
-## Legacy Compatibility Endpoints
-
-Still available:
-- `POST /api/mutations/stage`
-- `POST /api/mutations`
-- `POST /api/mutations/toggle`
-
-Note: legacy staged arithmetic operations may be accepted by payload/UI, but deterministic engine execution currently centers on `REPLACE` and `PASS_THROUGH` behavior in this path.
-
-## Using SignalScope on Other Boards (Short Version)
-
-You do not need to rewrite the core runtime.
-
-Do this:
-1. Add a new PlatformIO env in `platformio.ini` for your board.
-2. Update board-specific pins + CAN backend wiring in `main.cpp`.
-3. Keep `core/` untouched (gateway/mutation/replay/cache logic).
-4. Verify with `/api/status`:
-   - `bus_a_ready=true`
-   - `bus_b_ready=true`
-   - ingress counters increasing
-   - no sustained `rx_drops_run`
-
-Minimum hardware requirement for full inline dual-bus behavior:
-- two CAN channels total (native + external, or two external, etc.)
-- enough MCU headroom for your traffic rate (dual-core recommended)
-
-## Troubleshooting
-
-- `LittleFS not mounted`: run erase -> upload -> uploadfs
-- `partition "spiffs" could not be found`: ensure partition label remains `littlefs`
-- UI missing/stale: verify `data/index.html` exists and run `uploadfs` again
-- Sparse live data: check `ingress_a_frames` and `ingress_b_frames` in `/api/status`
+- [Getting started](docs/GETTING_STARTED.md) — build, flash, connect, and verify the device.
+- [Core concepts](docs/CONCEPTS.md) — frames, DBCs, signals, directions, observation, and rules.
+- [First app](docs/FIRST_APP.md) — a complete oil-temperature walkthrough.
+- [Rules and packages](docs/RULES.md) — lifecycle and `.ssrules` syntax.
+- [Application extension](docs/APPLICATION_EXTENSION.md) — native app boundary and services.
+- [HTTP API](docs/API.md) — routes, parameters, and examples.
+- [Architecture](ARCH.md) — runtime ownership, data flow, and invariants.
+- [Changelog](CHANGELOG.md) — project-level changes.
+- [Third-party notices](THIRD_PARTY_NOTICES.md) — build dependencies and asset policy.
 
 ## License
 
-See [LICENSE](LICENSE).
-
-![Screenshot](screenshot.png)
+SignalScope source, documentation, and the bundled standalone web interface are licensed under the [MIT License](LICENSE). Third-party dependencies remain under their respective licenses.

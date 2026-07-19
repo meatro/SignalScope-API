@@ -25,6 +25,15 @@ char* trim(char* value) {
     return value;
 }
 
+bool parseUnsignedToken(const char* text, int base, uint32_t maximum, uint32_t& output) {
+    if (text == nullptr || text[0] == '\0' || text[0] == '-') return false;
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(text, &end, base);
+    if (end == text || *end != '\0' || value > maximum) return false;
+    output = static_cast<uint32_t>(value);
+    return true;
+}
+
 Direction parseDirection(const char* token, Direction fallback) {
     if (token == nullptr) {
         return fallback;
@@ -49,11 +58,14 @@ void ReplayEngine::init() {
     loop_mode_ = ReplayLoopMode::PLAY_ONCE;
     next_due_us_ = 0;
     loop_counter_ = 0;
+    dispatch_mode_ = ReplayDispatchMode::PHYSICAL;
 }
 
-bool ReplayEngine::loadLogCsv(const char* text, size_t length, Direction default_direction) {
+bool ReplayEngine::loadLogCsv(const char* text, size_t length, Direction default_direction,
+                              ReplayDispatchMode dispatch_mode) {
     frame_count_ = 0;
     cursor_ = 0;
+    dispatch_mode_ = dispatch_mode;
 
     if (text == nullptr || length == 0U) {
         return false;
@@ -124,6 +136,11 @@ void ReplayEngine::start(ReplayLoopMode mode, uint32_t now_us) {
     next_due_us_ = now_us;
 }
 
+void ReplayEngine::start(ReplayLoopMode mode, uint32_t now_us, ReplayDispatchMode dispatch_mode) {
+    dispatch_mode_ = dispatch_mode;
+    start(mode, now_us);
+}
+
 void ReplayEngine::stop() {
     playing_ = false;
 }
@@ -133,13 +150,21 @@ void ReplayEngine::tick(uint32_t now_us) {
         return;
     }
 
-    while (playing_ && now_us >= next_due_us_) {
+    size_t dispatched = 0U;
+    while (playing_ && now_us >= next_due_us_ && dispatched < kMaxFramesPerTick) {
         const ReplayFrame& replay_frame = frames_[cursor_];
+        bool accepted = true;
         if (tx_callback_ != nullptr) {
-            tx_callback_(replay_frame.frame);
+            accepted = tx_callback_(replay_frame.frame, dispatch_mode_);
         }
 
+        // A refused replay frame is intentionally consumed rather than retried:
+        // the gateway may already have advanced a stateful counter/checksum
+        // mutation before learning that the hardware mailbox is busy. Replaying
+        // it would apply that mutation twice. Physical frames are never handled
+        // here and instead remain in GatewayCore's lossless egress queues.
         ++cursor_;
+        ++dispatched;
         if (cursor_ >= frame_count_) {
             if (loop_mode_ == ReplayLoopMode::PLAY_ONCE) {
                 playing_ = false;
@@ -153,6 +178,7 @@ void ReplayEngine::tick(uint32_t now_us) {
         }
 
         scheduleNext(now_us);
+        if (!accepted) return;
     }
 }
 
@@ -166,6 +192,14 @@ size_t ReplayEngine::frameCount() const {
 
 size_t ReplayEngine::cursor() const {
     return cursor_;
+}
+
+ReplayDispatchMode ReplayEngine::dispatchMode() const {
+    return dispatch_mode_;
+}
+
+bool ReplayEngine::isDryRun() const {
+    return dispatch_mode_ == ReplayDispatchMode::DRY_RUN;
 }
 
 bool ReplayEngine::parseLogLine(const char* line, uint32_t previous_ts, Direction default_direction, ReplayFrame& out_frame) {
@@ -186,12 +220,13 @@ bool ReplayEngine::parseLogLine(const char* line, uint32_t previous_ts, Directio
         return false;
     }
 
-    const uint32_t timestamp_us = static_cast<uint32_t>(std::strtoul(tokens[0], nullptr, 10));
-    const uint32_t can_id = static_cast<uint32_t>(std::strtoul(tokens[1], nullptr, 0));
-    const uint8_t dlc = static_cast<uint8_t>(std::strtoul(tokens[2], nullptr, 10));
-    if (dlc > 8U) {
-        return false;
-    }
+    uint32_t timestamp_us = 0U;
+    uint32_t can_id = 0U;
+    uint32_t dlc_value = 0U;
+    if (!parseUnsignedToken(tokens[0], 10, UINT32_MAX, timestamp_us) ||
+        !parseUnsignedToken(tokens[1], 0, 0x1FFFFFFFU, can_id) ||
+        !parseUnsignedToken(tokens[2], 10, 8U, dlc_value)) return false;
+    const uint8_t dlc = static_cast<uint8_t>(dlc_value);
 
     CanFrame frame;
     frame.timestamp_us = timestamp_us;
@@ -200,7 +235,9 @@ bool ReplayEngine::parseLogLine(const char* line, uint32_t previous_ts, Directio
     frame.direction = (token_count >= 12U) ? parseDirection(tokens[11], default_direction) : default_direction;
 
     for (uint8_t i = 0; i < 8U; ++i) {
-        frame.data[i] = static_cast<uint8_t>(std::strtoul(tokens[3U + i], nullptr, 16));
+        uint32_t byte_value = 0U;
+        if (!parseUnsignedToken(tokens[3U + i], 16, 0xFFU, byte_value)) return false;
+        frame.data[i] = static_cast<uint8_t>(byte_value);
     }
 
     out_frame.frame = frame;
